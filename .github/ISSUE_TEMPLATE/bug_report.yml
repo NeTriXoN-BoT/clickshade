@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible ClickShade issue.
+title: "[Bug] "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: ClickShade version and build source
+      placeholder: 1.0, release ZIP or local build
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Desktop environment
+      description: OS/version, X11 or Wayland/compositor, monitors/DPI/refresh, cursor theme and size.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps, expected behavior, and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: isolation
+    attributes:
+      label: Isolation and diagnostics
+      description: Does it persist with sounds/overlays disabled? Which app/game and display mode? Include relevant errors; remove private paths.

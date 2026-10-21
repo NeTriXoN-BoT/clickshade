@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="ClickShade — desktop cursor effects">
+<defs><linearGradient id="background" x2="0" y2="1"><stop stop-color="#141e2c"/><stop offset="1" stop-color="#0b111b"/></linearGradient></defs>
+<rect width="1280" height="640" fill="url(#background)"/>
+<g fill="none" stroke-width="2"><circle cx="1089" cy="275" r="285" stroke="#203b42"/><circle cx="1089" cy="275" r="235" stroke="#234b50"/><circle cx="1089" cy="275" r="182" stroke="#326d6d"/></g>
+<g><circle cx="806" cy="439" r="5" fill="#25474c"/><circle cx="839" cy="425" r="7" fill="#315b60"/><circle cx="874" cy="410" r="9" fill="#437e7d"/><circle cx="912" cy="391" r="11" fill="#67c3b5"/></g>
+<g transform="translate(946 157) scale(1.1015625)">
+  <defs>
+    <linearGradient id="tile" x2="0" y2="1"><stop stop-color="#1c2b3c"/><stop offset="1" stop-color="#091019"/></linearGradient>
+    <linearGradient id="orbit" x2="0" y2="1"><stop stop-color="#5fe8ca"/><stop offset="1" stop-color="#45a5e9"/></linearGradient>
+  </defs>
+  <rect x="6" y="6" width="244" height="244" rx="55" fill="url(#tile)" stroke="#35465a"/>
+  <circle cx="128" cy="124" r="76" fill="#162e39" stroke="url(#orbit)" stroke-width="10"/>
+  <polygon points="72,48 86,187 117,158 143,202 164,189 139,144 180,138" transform="translate(2 4)" fill="#08111c" stroke="#08111c" stroke-width="10" stroke-linejoin="round"/>
+  <polygon points="72,48 86,187 117,158 143,202 164,189 139,144 180,138" fill="#f2f8fd"/>
+  <polygon points="72,48 180,138 139,144 164,189 154,195 126,143 157,137" fill="#8adadf"/>
+  <polygon points="72,48 86,187 117,158 143,202 164,189 139,144 180,138" fill="none" stroke="#0b1724" stroke-width="5.5" stroke-linejoin="round"/>
+</g>
+<g font-family="Segoe UI,DejaVu Sans,sans-serif">
+<text x="80" y="87" font-size="18" font-weight="700" fill="#82e5d0">DESKTOP CURSOR EFFECTS</text>
+<text x="74" y="211" font-size="92" font-weight="700" fill="#f4f8fc">ClickShade</text>
+<text x="80" y="282" font-size="32" fill="#e4edf4">Cursor effects for your desktop.</text>
+<g font-size="25" fill="#a4b5c6"><text x="80" y="341">Highlights, press feedback, trails</text><text x="80" y="379" font-size="23">and click sounds. All your settings stay local.</text></g>
+<g fill="#172b35" stroke="#31515b"><rect x="80" y="444" width="172" height="46" rx="23"/><rect x="268" y="444" width="160" height="46" rx="23"/><rect x="444" y="444" width="134" height="46" rx="23"/></g>
+<g font-size="19" fill="#c4e7e2"><text x="103" y="477">Native C++</text><text x="291" y="477">Windows</text><text x="467" y="477">Linux</text></g>
+<path d="M80 548H1200" stroke="#2a3b4a"/>
+<text x="80" y="592" font-size="18" fill="#7f95a9">No account. No telemetry. Open source.</text>
+<text x="1035" y="590" font-size="15" font-weight="700" fill="#82e5d0">OPEN SOURCE</text>
+</g></svg>

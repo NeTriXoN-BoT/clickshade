@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Development-only module marker for ClickShade's GNOME syntax and logic checks. No npm dependencies."
+}

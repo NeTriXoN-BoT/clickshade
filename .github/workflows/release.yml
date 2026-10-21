@@ -1,0 +1,51 @@
+name: Draft release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example v1.0)
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: refs/tags/${{ inputs.tag }}
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: ci/windows
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-x64
+          path: ci/linux
+      - name: Package exact compiled ref
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util, os
+          spec = importlib.util.spec_from_file_location('package', 'tools/package_release.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          if os.environ['RELEASE_TAG'] != 'v' + module.VERSION:
+              raise SystemExit('Tag and package version differ; update all release version fields first.')
+          PY
+          python3 tools/package_release.py --expected-revision "$(git rev-parse HEAD)" --build-dir ci/windows --linux-build-dir ci/linux --output dist/ClickShade-${RELEASE_TAG#v}-Windows-Linux.zip --compiler "Windows: MSVC Windows-2022 runner; Linux: Ubuntu-24.04 GCC; CMake Release"
+      - name: Create draft for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/*.zip --verify-tag --draft --title "ClickShade $RELEASE_TAG" --notes-file RELEASE-NOTES.md

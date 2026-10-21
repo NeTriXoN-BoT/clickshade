@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ClickShade
+GenericName=Pointer effects
+Comment=Pointer highlights, click animations, and custom sound cues
+Exec=ClickShade
+Icon=clickshade
+Terminal=false
+Categories=Utility;Accessibility;
+StartupNotify=true
+StartupWMClass=ClickShade

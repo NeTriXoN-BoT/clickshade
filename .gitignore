@@ -1,0 +1,26 @@
+/build/
+/build-*/
+/release/
+/Testing/
+/.vs/
+*.user
+*.suo
+settings.ini
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.zip
+/dist/
+
+# Local QA captures and tool output; curated assets/screenshots are versioned.
+/*.bmp
+/*.log
+*.tmp
+*.bak
+
+# Exported private settings profiles and their backups.
+*.ini
