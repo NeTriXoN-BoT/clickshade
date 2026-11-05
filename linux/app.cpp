@@ -2,6 +2,7 @@
 #include "settings.h"
 #include "icon_data.h"
 #include "hotkeys.h"
+#include "../src/version.h"
 
 #include <gtk/gtk.h>
 #include <X11/Xlib.h>
@@ -98,6 +99,7 @@ public:
     ~Application() {
         if (saveTimer_) g_source_remove(saveTimer_);
         if (statusTimer_) g_source_remove(statusTimer_);
+        EndTrayWait(false);
         hotkeys_.Stop();
         if (engine_) engine_->Stop();
         if (tray_) g_object_unref(tray_);
@@ -106,11 +108,11 @@ public:
     void Present(bool background = false) {
         const bool first = !window_;
         if (first) Build();
-        gtk_widget_show_all(window_);
-        gtk_window_present(GTK_WINDOW(window_));
-        if (background || (first && settings_.startMinimized)) {
-            if (tray_ && gtk_status_icon_is_embedded(tray_)) gtk_widget_hide(window_);
-            else gtk_window_iconify(GTK_WINDOW(window_));
+        if (background || (first && settings_.startMinimized)) StartHidden();
+        else {
+            EndTrayWait(false);
+            gtk_widget_show_all(window_);
+            gtk_window_present(GTK_WINDOW(window_));
         }
         if (!statusTimer_) statusTimer_ = g_timeout_add(700, +[](gpointer data) -> gboolean {
             auto* self = static_cast<Application*>(data);
@@ -155,7 +157,8 @@ private:
     bool refreshing_ = false;
     GdkRectangle lastWorkArea_{};
     double effectiveZoom_ = 1;
-    guint saveTimer_ = 0, statusTimer_ = 0, previewTick_ = 0;
+    guint saveTimer_ = 0, statusTimer_ = 0, previewTick_ = 0, trayWait_ = 0;
+    gulong embeddedHandler_ = 0;
     std::string saveError_;
     std::string hotkeyEditError_;
     GlobalHotkeys hotkeys_;
@@ -167,6 +170,55 @@ private:
     std::vector<Pulse> pulses_;
     bool previewPressed_ = false;
 
+    // Background and start-minimized launches never show the window: it stays
+    // in the tray, or appears minimized where no tray takes the icon.
+    void StartHidden() {
+        if (gtk_widget_get_visible(window_)) {
+            if (tray_ && gtk_status_icon_is_embedded(tray_)) gtk_widget_hide(window_);
+            else gtk_window_iconify(GTK_WINDOW(window_));
+            return;
+        }
+        if (tray_ && gtk_status_icon_is_embedded(tray_)) return;
+        // A Wayland session has no XEmbed tray to wait for.
+        if (!tray_ || wayland_) { ShowMinimized(); return; }
+        if (trayWait_) return;
+        // XEmbed docking is asynchronous, so a fresh icon is never embedded
+        // yet. Wait briefly before falling back to a minimized window.
+        embeddedHandler_ = g_signal_connect(tray_, "notify::embedded", G_CALLBACK(+[](GObject*, GParamSpec*, gpointer data) {
+            auto* self = static_cast<Application*>(data);
+            if (!gtk_status_icon_is_embedded(self->tray_)) return;
+            // Docked after the wait already minimized the window: the tray
+            // takes it, unless the user opened it meanwhile.
+            if (!self->trayWait_ && self->window_ && gtk_widget_get_visible(self->window_)) {
+                GdkWindow* surface = gtk_widget_get_window(self->window_);
+                if (surface && (gdk_window_get_state(surface) & GDK_WINDOW_STATE_ICONIFIED)) gtk_widget_hide(self->window_);
+            }
+            self->EndTrayWait(false);
+        }), this);
+        trayWait_ = g_timeout_add(1500, +[](gpointer data) -> gboolean {
+            auto* self = static_cast<Application*>(data);
+            self->trayWait_ = 0;
+            self->EndTrayWait(true);
+            return G_SOURCE_REMOVE;
+        }, this);
+    }
+    void EndTrayWait(bool minimize) {
+        if (trayWait_) { g_source_remove(trayWait_); trayWait_ = 0; }
+        if (minimize && window_ && !gtk_widget_get_visible(window_)) {
+            ShowMinimized();
+            // A panel that starts slowly at login may still dock the icon;
+            // the embedded handler stays connected for that.
+            if (embeddedHandler_) return;
+        }
+        if (embeddedHandler_) { g_signal_handler_disconnect(tray_, embeddedHandler_); embeddedHandler_ = 0; }
+    }
+    void ShowMinimized() {
+        // X11 maps a window iconified before showing it straight into the
+        // taskbar; Wayland can only minimize a window that is already mapped.
+        gtk_window_iconify(GTK_WINDOW(window_));
+        gtk_widget_show_all(window_);
+        if (wayland_) gtk_window_iconify(GTK_WINDOW(window_));
+    }
     GtkWidget* Button(const char* text, std::function<void()> action, const char* style = nullptr) {
         auto* button = gtk_button_new_with_label(text);
         if (style) Class(button, style);
@@ -462,6 +514,13 @@ private:
             for (; !error && iterator != end && inspected < 2048; iterator.increment(error), ++inspected) {
                 std::error_code typeError;
                 if (iterator.depth() >= 2) iterator.disable_recursion_pending();
+                // Keyboard sets have their own picker, as on Windows.
+                if (iterator.depth() == 0 && iterator->is_directory(typeError) && !typeError &&
+                    g_ascii_strcasecmp(iterator->path().filename().string().c_str(), "keyboard") == 0) {
+                    iterator.disable_recursion_pending();
+                    continue;
+                }
+                typeError.clear();
                 if (!iterator->is_regular_file(typeError) || typeError) continue;
                 std::string extension = iterator->path().extension().string();
                 std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
@@ -582,14 +641,17 @@ private:
         Slider(shakeControls, "Maximum size", &Settings::shakeMaximumScale, 150, 400, "%", 10);
         gtk_widget_set_sensitive(shakeControls, !wayland_);
 
-        auto* rules = Card(page, "Automatic pause", "The master switch pauses every effect. Fullscreen and excluded applications also pause highlights and sounds.");
-        Toggle(rules, "Pause for fullscreen applications", &Settings::pauseFullscreen);
+        auto* rules = Card(page, "Automatic pause", "The master switch pauses every effect. Fullscreen games and excluded applications also pause highlights and sounds.");
+        Toggle(rules, "Pause in fullscreen games", &Settings::pauseFullscreen,
+            "Steam, Proton and Wine, gamescope, Heroic, Lutris and itch games. Browsers, video players and presentations keep their effects in fullscreen.");
         Toggle(rules, "Pause when the pointer is confined", &Settings::pauseConfinedCursor,
                "Saved preference. Reliable confinement detection is unavailable in this Linux build.", false);
         ApplicationList(rules, "Excluded applications", &Settings::excludedProcesses);
         ApplicationList(rules, "Always allow in these apps", &Settings::allowedProcesses);
         Pack(rules, Label("Separate executable basenames or window classes with semicolons. GNOME also accepts application IDs.", "muted small", true));
-        Pack(rules, Label("Allowed apps bypass fullscreen pause. Exclusions still win; locking the session or hiding the pointer still pauses effects.", "muted small", true));
+        Pack(rules, Label(wayland_
+            ? "Allowed apps bypass fullscreen pause. Exclusions still win; locking the session or hiding the pointer still pauses effects. The magnifier stays in place while you type."
+            : "Allowed apps bypass fullscreen pause. Exclusions still win; locking the session or hiding the pointer still pauses effects. With keyboard sounds or the key display on, the spotlight and the magnifier stay in place while you type.", "muted small", true));
 
         auto* profiles = Card(page, "Cursor profiles", "These settings are retained for compatibility with the Windows build. Linux currently supports the installed theme at its existing size; profile replacement and reverse mode are unavailable.");
         auto* profileControls = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
@@ -874,7 +936,7 @@ private:
         auto* header = gtk_header_bar_new();
         gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
         gtk_header_bar_set_title(GTK_HEADER_BAR(header), "ClickShade");
-        gtk_header_bar_set_subtitle(GTK_HEADER_BAR(header), "Linux · 1.0");
+        gtk_header_bar_set_subtitle(GTK_HEADER_BAR(header), (std::string("Linux · ") + CLICKSHADE_VERSION).c_str());
         gtk_window_set_titlebar(GTK_WINDOW(window_), header);
         auto* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_container_add(GTK_CONTAINER(window_), content);
@@ -1400,12 +1462,12 @@ int main(int argc, char** argv) {
     using namespace clickshade::linuxapp;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
-            std::cout << "ClickShade 1.0 — Linux x64\nUsage: ClickShade [--background|--restore|--quit]\n"
+            std::cout << "ClickShade " << CLICKSHADE_VERSION << " — Linux x64\nUsage: ClickShade [--background|--restore|--quit]\n"
                          "Native X11 effects or the optional GNOME Wayland companion.\n"
                          "Settings: " << SettingsPath() << '\n';
             return 0;
         }
-        if (std::string(argv[i]) == "--version") { std::cout << "ClickShade 1.0 Linux x64\n"; return 0; }
+        if (std::string(argv[i]) == "--version") { std::cout << "ClickShade " << CLICKSHADE_VERSION << " Linux x64\n"; return 0; }
     }
     XInitThreads();
     auto* gtk = gtk_application_new("io.clickshade.ClickShade", G_APPLICATION_HANDLES_COMMAND_LINE);

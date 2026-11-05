@@ -233,10 +233,50 @@ export function curve(fraction, easing) {
     return [t, remaining];
 }
 
-// Breathing: a slow 2.6 s swell of radius and opacity, as on Windows and X11.
+// Breathing here: a slow 2.6 s swell of radius and opacity. Windows pulses
+// only the opacity, between 55 and 100 percent on a 3.2 s cycle.
 export function breath(microseconds) {
     const phase = Math.sin(microseconds / 1e6 * 2 * Math.PI / 2.6);
     return {radius: 0.92 + 0.08 * phase, opacity: 0.76 + 0.24 * phase};
+}
+
+// A slow pulse needs about 30 repaints a second, whatever the sampling rate
+// (Windows paces its breathing the same way).
+export const BREATH_INTERVAL_US = Math.round(1e6 / 30);
+
+// Editors hide the pointer while you type. A pointer that hides within
+// TYPING_START_US of a key press starts a typing hold, which lasts until the
+// pointer shows again or TYPING_HOLD_US pass without a key. Any other hidden
+// pointer is no typing hold. lastKey is 0 before the first key press.
+export const TYPING_START_US = 1500000, TYPING_HOLD_US = 3000000;
+export function typingHold(holding, wasHidden, hidden, lastKey, now) {
+    if (!hidden) return false;
+    const started = wasHidden ? holding : lastKey > 0 && now - lastKey <= TYPING_START_US;
+    return started && now - lastKey < TYPING_HOLD_US;
+}
+
+// /proc/<pid>/cmdline: NUL-separated arguments, bounded.
+export function parseCommandLine(text) {
+    return String(text ?? '').split('\0').filter(Boolean).slice(0, 256);
+}
+
+// Fullscreen pauses the effects only for games, as on Windows and X11.
+// Browsers, video players and presentations keep their effects.
+const GAME_FOLDERS = ['/steamapps/common/', '/games/heroic/', '/lutris/', '/itch/apps/'];
+const GAME_PROGRAMS = new Set(['wine', 'wine64', 'wine-preloader', 'wine64-preloader', 'gamescope']);
+export function isGameWindow({wmClass = '', exe = '', argv = [], home = ''} = {}) {
+    const windowClass = String(wmClass ?? '');
+    if (/^steam_app_/i.test(windowClass) || windowClass.toLowerCase() === 'gamescope') return true;
+    const games = home ? `${String(home).replace(/\/+$/, '')}/Games/` : '';
+    for (const path of [String(exe ?? ''), String(argv[0] ?? '')]) {
+        if (!path) continue;
+        const lower = path.toLowerCase();
+        if (GAME_PROGRAMS.has(lower.slice(lower.lastIndexOf('/') + 1))) return true;
+        // Steam libraries, Heroic, Lutris (runners and its ~/Games default) and itch.
+        if (GAME_FOLDERS.some(folder => lower.includes(folder)) || (games && path.startsWith(games))) return true;
+    }
+    // Wine and Proton show the Windows program as the command line.
+    return argv.some(item => /\.exe$/i.test(item) && !item.includes('://'));
 }
 
 export function excluded(configured, identities) {

@@ -7,7 +7,8 @@ namespace clickshade {
 
 // Pure, in-memory workload pacing. Observe only actual render work, with the
 // interval between active frame starts as elapsedSeconds. Waiting/sleeping is
-// never work; idle intervals do not earn an immediate up/down transition.
+// never work; idle intervals do not earn an immediate up/down transition, and
+// they do not erase the headroom that active frames have earned so far.
 class AdaptiveFramePacer {
 public:
     bool Configure(unsigned monitorHz, unsigned manualHz = 0) noexcept {
@@ -18,6 +19,7 @@ public:
         manualHz_ = manualHz;
         rate_ = manualHz_ ? manualHz_ : monitorHz_;
         ClearHistory();
+        headroomSeconds_ = 0.0;
         return true;
     }
 
@@ -26,9 +28,13 @@ public:
         if (manualHz_ || !std::isfinite(workSeconds) || !std::isfinite(elapsedSeconds) ||
             workSeconds < 0.0 || elapsedSeconds <= 0.0) return false;
         // A compositor stall is a sample, not permission to spend several
-        // seconds of hysteresis at once. Very long gaps start a new observation.
-        if (elapsedSeconds > 0.25) ClearHistory();
-        const double elapsed = std::clamp(elapsedSeconds, 0.001, 0.05);
+        // seconds of hysteresis at once. Very long gaps start a new observation
+        // and count as one ordinary frame, so idle time never earns headroom.
+        double elapsed = std::clamp(elapsedSeconds, 0.001, 0.05);
+        if (elapsedSeconds > 0.25) {
+            ClearHistory();
+            elapsed = 1.0 / rate_;
+        }
         const double work = std::min(workSeconds, 0.25);
         if (!haveAverage_) { averageWork_ = work; haveAverage_ = true; }
         else {
@@ -67,9 +73,12 @@ public:
     bool Automatic() const noexcept { return manualHz_ == 0; }
 
 private:
+    // A gap starts a new observation but keeps the headroom already earned:
+    // short animations separated by idle time (clicks) must still add up to
+    // a recovery. Only frames without headroom take that progress away.
     void ClearHistory() noexcept {
         haveAverage_ = false;
-        averageWork_ = busySeconds_ = headroomSeconds_ = 0.0;
+        averageWork_ = busySeconds_ = 0.0;
     }
     unsigned monitorHz_ = 60;
     unsigned manualHz_ = 0;

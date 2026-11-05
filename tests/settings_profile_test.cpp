@@ -277,6 +277,22 @@ void Run() {
           "all bounded long path fields fit the profile size budget without truncation");
     changed.middleSoundPath=L"bad\nEnabled=1";
     Check(!SaveSettingsProfile(second,changed,error),"export rejects multiline text that could inject a second setting");
+    // Imported paths that would make Windows sign in to another computer.
+    for(const wchar_t* remote:{LR"(\\host\s\a.wav)",LR"(//host/s/a.wav)",LR"(\\host@SSL\DavWWWRoot\a.wav)",LR"(\\host@80\s)",
+                               LR"(\\?\UNC\h\s)",LR"(\\.\pipe\x)",LR"(\\?\GLOBALROOT\Device\Mup\h\s)",LR"(\??\UNC\h\s)",LR"(/\host\share)"})
+        Check(clickshade::IsNetworkOrDevicePath(remote),"a network or device path in a profile is recognized");
+    for(const wchar_t* local:{LR"()",LR"(C:\sounds\a.wav)",LR"(relative\a.wav)",LR"(\\?\C:\sounds\a.wav)",LR"(\sounds\rooted.wav)",LR"(C:relative.wav)"})
+        Check(!clickshade::IsNetworkOrDevicePath(local),"a local path in a profile is not treated as a network path");
+    Settings remote=original;
+    remote.releasedCursorPath=LR"(\\host\s\r.cur)"; remote.pressedCursorPath=LR"(C:\cursors\p.cur)";
+    remote.leftSoundPath=LR"(\\host\s\l.wav)"; remote.rightSoundPath=LR"(C:\sounds\r.wav)";
+    remote.middleSoundPath=LR"(\\?\UNC\h\s\m.wav)"; remote.keyboardSoundPath=LR"(//host/s/keys)";
+    const auto fields=clickshade::NetworkProfilePaths(remote);
+    Check(fields.size()==4&&fields[0].member==&Settings::releasedCursorPath&&fields[1].member==&Settings::leftSoundPath&&
+          fields[2].member==&Settings::middleSoundPath&&fields[3].member==&Settings::keyboardSoundPath,
+          "the import confirmation lists exactly the remote path fields, in order");
+    Check(!clickshade::ExecutableLocationProtected(),
+          "a test build folder is not a protected location for the elevated startup task");
     Check(IsStartupEnabled()==startup,"the entire profile test leaves startup registration untouched");
 }
 }

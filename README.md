@@ -3,7 +3,7 @@
 ClickShade makes your mouse pointer easier to follow and a bit more fun to use. Hold a mouse button and the cursor goes dark. Put a highlight, a spotlight or a crosshair under it. Give each mouse button its own click animation and sound, add a typing sound if you like, and shake the mouse when you've lost the pointer. It's a native C++ app for Windows with a Linux port, and nothing leaves your computer.
 
 > [!NOTE]
-> This project is vibe coded. It's made by one person who picked the features, tested everything on their own machines and decided what ships, with AI coding assistants writing a large share of the code. It's a first release, so if something looks off, please [open an issue](../../issues).
+> This project is vibe coded. It's made by one person who picked the features, tested everything on their own machines and decided what ships, with AI coding assistants writing a large share of the code. It's still a young project, so if something looks off, please [open an issue](../../issues).
 
 > [!IMPORTANT]
 > While it runs, ClickShade replaces the Windows system cursors with its own copies and restores the originals when it pauses or quits. If it is ever closed the hard way, run `Restore-cursors.cmd` from the download or `ClickShade.exe --restore`. The Windows build is unsigned, so SmartScreen may warn on first start.
@@ -15,7 +15,7 @@ ClickShade makes your mouse pointer easier to follow and a bit more fun to use. 
 | Feature | What you get |
 | --- | --- |
 | Cursor on press | Hold a mouse button and the cursor switches to a dark version; release and it comes back. Reverse light and dark, keep it while holding or flash it briefly, and choose which buttons trigger it. |
-| Cursor styles and size | Your installed theme, the Windows arrow, a classic arrow drawn crisply at any size, or your own `.cur` pair. A cursor scale from 100% to 600% of the size Windows uses applies to every cursor shape, the busy spinner included. |
+| Cursor styles and size | Your installed theme, the Windows arrow, a classic arrow drawn crisply at any size, or your own `.cur` pair. A cursor scale from 100% to 600% of the size Windows uses applies to every cursor shape, the busy spinner included. Every cursor, animated ones included, stays crisp at any pointer size and display scaling. |
 | Cursor look | Fade the cursor down to 30% opacity, give it a soft drop shadow, or paint it in your own fill and outline colors. Like the scale, the look reaches every cursor shape, animated ones included, and works with or without the press effect. |
 | Shake to find | A Plasma-style preset that follows KWin's published detector exactly, or a macOS-inspired one that reacts to a couple of quick wiggles. Sensitivity and maximum size are yours to set. |
 | Highlight | Filled, ring, soft glow, crosshair, or a spotlight that dims the rest of the screen. Color, radius, opacity and width, optional breathing, and hide-when-resting. |
@@ -25,10 +25,10 @@ ClickShade makes your mouse pointer easier to follow and a bit more fun to use. 
 | Keyboard sounds | A separate switch, volume and shortcut. Five sets, from classic typing to a typewriter, with shuffled key variants plus space, enter and backspace. |
 | Magnifier | A live lens that follows the pointer, round or rounded square, centered on the pointer or beside it, 1.25× to 8×. Your own highlights and click effects stay out of it. |
 | Key display | The keys you press, shown as keycaps on rounded panels in the style of the Mac keystroke visualizers: shortcuts only (Ctrl, Alt or Win chords and function keys) or every key, with typed letters joined into words. Optional mouse buttons, four positions, size, hold time and colors. A row lives only while it is on screen. |
-| Smart pause | Pauses in fullscreen apps, when a game confines the pointer and on the lock screen. Exclude any executable, or allow-list the desktop tools that should keep working. |
-| Administrator mode | Optional. Keeps effects, shortcuts and held-button tracking working over Task Manager, installers and other elevated windows. |
+| Smart pause | Pauses in fullscreen games, when a game confines the pointer and on the lock screen; browsers, video players and presentations keep their effects in fullscreen. Pointer effects and click sounds hide while an app hides the pointer, and the key display and typing sounds keep going. Exclude any executable, or allow-list the desktop tools that should keep working. |
+| Administrator mode | Optional. Keeps effects, shortcuts and held-button tracking working over Task Manager, installers and other elevated windows. It starts with Windows without a prompt when ClickShade was copied or extracted into a protected folder such as Program Files. |
 | Recordings | Effects show up in OBS, ShareX, the Snipping Tool and similar tools. One switch keeps them off recordings instead. |
-| Crash recovery | If ClickShade crashes, it restores your cursors first, writes a report to the settings folder, and comes back once with a note. |
+| Crash recovery | If ClickShade crashes, it restores your cursors first, writes a report to the settings folder, and comes back with a note. After three restarts in a row it stops and tells you instead. |
 | Settings window | A sidebar, compact cards, a reset on every card and every slider, dark and light palettes, extra zoom, and an animated spectrum line you can turn off. |
 | Everyday controls | Nine global shortcuts, tray menu, optional start with Windows, settings profiles with backup and import, and a full defaults reset. |
 
@@ -53,7 +53,7 @@ ClickShade makes your mouse pointer easier to follow and a bit more fun to use. 
 
 Out of the box, a held left or right button darkens the cursor, a yellow highlight follows the pointer, and clicks draw neon blue and neon red rings. Sounds, trails, shake-to-locate, middle-click effects, the magnifier, the key display, administrator mode and start with Windows are off until you turn them on.
 
-`CHECKSUMS.sha256` in the ZIP covers every file. To keep settings next to the executable instead of in your profile, create an empty file named `ClickShade.portable` beside `ClickShade.exe`.
+`CHECKSUMS.sha256` in the ZIP covers every file. To keep settings next to the executable instead of in your profile, create an empty file named `ClickShade.portable` beside `ClickShade.exe`; `settings.ini`, `profiles` and `crash-reports` then sit right next to it.
 
 ## Using it
 
@@ -66,7 +66,7 @@ The window has eight pages. Every setting saves as you change it, and every card
 | Clicks | Per-button switches and colors, click style, radius, duration, opacity, width, easing. |
 | Sounds | Click sounds per button, keyboard sound set, both volumes, library refresh. |
 | Presenter | Magnifier lens (shape, placement, zoom, size, frame color or no frame) and key display (what to show, mouse buttons, position, size, hold time, opacity, backdrop). |
-| Rules | Fullscreen and confined-pointer pause, excluded and allowed apps, administrator mode, recording visibility, startup. |
+| Rules | Fullscreen-game and confined-pointer pause, excluded and allowed apps, administrator mode, recording visibility, startup. |
 | Appearance | Dark or light palette, presets and custom colors, extra zoom, spectrum line, frame pacing for all effects, profiles, restore all defaults. |
 | Shortcuts | Nine global shortcuts, recorded or typed. |
 
@@ -100,7 +100,10 @@ Only one instance runs per session; a second launch just opens the settings wind
 | --- | --- |
 | The cursor stayed dark or changed after ClickShade was killed | Run `Restore-cursors.cmd` from the download or `ClickShade.exe --restore`; signing out also resets the scheme. |
 | Effects vanish over Task Manager, installers or some games | Those windows run elevated. Turn on **Run ClickShade as administrator** on the Rules page. |
-| Effects pause in a windowed game or a full-screen browser | The fullscreen or confined-pointer rule fired. Add the app to **Always allow in these apps**, or turn the rule off. |
+| Windows asks for approval at every sign-in | Administrator mode starts silently only from a protected folder such as Program Files. Copy the ClickShade folder there (a folder moved on the same drive keeps your account as owner and still counts as unprotected), start that copy and switch **Start with Windows** on again. |
+| Effects pause in an app that is not a game | The confined-pointer rule fired, or the app is on Windows' game list or runs from a game library folder and was taken for a fullscreen game. Add it to **Always allow in these apps**, or turn the rule off. |
+| Effects keep running in a fullscreen game | ClickShade did not recognise it as a game. Add its executable under **Excluded applications** on the Rules page. |
+| Effects disappear while a video plays | The player hid the pointer, as YouTube does when the mouse rests. Move the mouse and they come back; the key display keeps working meanwhile. |
 | No effects in a particular app | It may be in the excluded list, or the session is locked, or the app hides the pointer itself. |
 | Effects missing from OBS or ShareX recordings | **Show effects in screenshots and recordings** is off on the Rules page. |
 | No sound | Sounds are off by default. Use **Test** next to a file; a missing codec or device shows an error on the Sounds page. |
@@ -112,7 +115,7 @@ Only one instance runs per session; a second launch just opens the settings wind
 
 ## Uninstall
 
-Turn off **Start with Windows** (and administrator mode, which removes its scheduled task), choose **Quit**, then delete the extracted folder. Settings live in `%LOCALAPPDATA%\ClickShade` on Windows and `~/.config/clickshade` on Linux; delete them too if you want a clean slate. ClickShade never deletes sound or cursor files you selected.
+Turn off **Start with Windows** (and administrator mode, which removes its scheduled task), choose **Quit**, then delete the extracted folder. Settings live in `%LOCALAPPDATA%\ClickShade` on Windows and `~/.config/clickshade` on Linux; delete them too if you want a clean slate. Quit removes the temporary cursor files ClickShade keeps under `%TEMP%\ClickShade` while it runs. ClickShade never deletes sound or cursor files you selected.
 
 ## Platform support
 
@@ -124,9 +127,9 @@ Turn off **Start with Windows** (and administrator mode, which removes its sched
 | Current cursor dark on press | Native system-role replacement | Software overlay of the current static cursor | Not implemented |
 | Reverse, custom pairs, default/classic presets, cursor sizing | Yes | Not implemented | Not implemented |
 | Shake-to-locate enlargement | Cached native system arrow | Cached current-cursor overlay | Use compositor facilities |
-| Magnifier lens | Windows Magnification API, centered or beside the pointer, own overlays excluded | Beside the pointer, read from the screen about 30 times a second | Square lens beside the pointer, cloned from the window layer |
+| Magnifier lens | Windows Magnification API, centered or beside the pointer, own overlays excluded | Beside the pointer, read from the screen as the pointer moves and about 30 times a second at rest | Square lens beside the pointer, cloned from the window layer |
 | Key display | Yes | Yes | Yes (Shell widgets) |
-| Fullscreen pause, app exclusions and allowances | Yes | Yes | Compositor-specific |
+| Fullscreen-game pause, app exclusions and allowances | Yes | Yes | Experimental (Shell window information) |
 | Administrator mode, capture visibility, crash recovery | Yes | Not applicable | Not applicable |
 | Global shortcuts | RegisterHotKey | X11 passive grabs | Not implemented |
 | Click and keyboard sounds | WAV + installed Windows codecs through WASAPI | WAV + PulseAudio-compatible server | Bridge; see adapter guide |
@@ -136,7 +139,7 @@ Xwayland is not a route to global native Wayland input. KDE Plasma, wlroots and 
 
 ## How it was built
 
-ClickShade is C++17. On Windows it observes the mouse through Raw Input without blocking it, replaces system cursor roles with its own prepared copies, draws effects in small click-through layered windows paced by one-shot timer deadlines, hosts the magnifier lens in the Windows Magnification API, and mixes sound in a sixteen-voice WASAPI mixer with a waveOut fallback. A dedicated receiver thread keeps accessibility-event floods out of the input and render queues. On Linux it uses XInput 2 and XFixes with Cairo overlays, and talks to the GNOME extension over D-Bus. The design is written up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the effect references (KDE, Apple, screen-recorder conventions) in [docs/EFFECTS.md](docs/EFFECTS.md).
+ClickShade is C++17. On Windows it observes the mouse through Raw Input without blocking it, replaces system cursor roles with its own prepared multi-size cursor files, draws effects in small click-through layered windows paced by one-shot timer deadlines, hosts the magnifier lens in the Windows Magnification API, and mixes sound in a sixteen-voice WASAPI mixer with a waveOut fallback. A dedicated receiver thread keeps accessibility-event floods out of the input and render queues. On Linux it uses XInput 2 and XFixes with Cairo overlays, and talks to the GNOME extension over D-Bus. The design is written up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the effect references (KDE, Apple, screen-recorder conventions) in [docs/EFFECTS.md](docs/EFFECTS.md).
 
 Use of AI: most of the code, tests and documentation were written with AI coding assistants. A human chose the goals, reviewed the results and tested the application on real hardware. AI output can contain mistakes, so check claims against the code and your own experience, and report anything wrong.
 
@@ -155,7 +158,7 @@ cmake --build build-msvc --config Release
 python tools/build_zig.py --zig /path/to/zig --test
 ```
 
-Builds the app and the developer checks in `build/`. The cursor, runtime and overlay suites need `--run` on an idle desktop with the app closed; they move the mouse and replace cursors while they run.
+Builds the app and the developer checks in `build/`. The cursor, runtime and overlay suites need `--run` on an idle desktop with the app closed. They move the mouse and replace cursors while they run; the runtime suite also opens a fullscreen test window and a fullscreen test "game" (a copy of itself in a temporary Steam-style folder under `%TEMP%`), and the overlay suite presses F24, a key with no standard function, and writes its screenshots beside `visual_smoke.exe`. Leave the mouse and keyboard alone meanwhile.
 
 ### Linux
 

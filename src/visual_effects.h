@@ -12,7 +12,6 @@ struct VisualEffectsStats {
     std::uint64_t frameCount = 0;
     std::uint64_t highlightMoves = 0;
     std::uint64_t highlightRasterizations = 0;
-    std::uint64_t clickFrames = 0;
     std::uint64_t pointerWakeups = 0;
     std::uint64_t stackWakeups = 0;
     std::uint64_t magnifierUpdates = 0; // Lens source refreshes (moves and live redraws).
@@ -43,6 +42,10 @@ public:
     // keyDisplayAllowed may stay true while a hidden pointer pauses the rest.
     void SetAllowed(bool allowed, bool keyDisplayAllowed);
     void PointerActivity() noexcept;
+    // Any mouse input (motion, buttons, wheel), reported even while the
+    // pointer is hidden or the effects pause. It only records the time, so
+    // that clicks, scrolling or a game's mouse look never count as typing.
+    void MouseInput() noexcept;
     void Click(unsigned buttonMask) noexcept;
     // One key (or mouse button, with kModMouse) for the on-screen key display.
     // The identity only travels to the renderer to become a label; it is

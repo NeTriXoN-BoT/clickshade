@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -32,6 +33,10 @@ constexpr unsigned kMouseSlots = 3;
 constexpr unsigned kKeyPreviewSlot = kMouseSlots + kKeyCategoryCount;
 constexpr unsigned kQueueSlots = kKeyPreviewSlot + 1;
 constexpr unsigned kKeyboardError = 3; // fileErrors index for the keyboard set.
+constexpr unsigned kMouseGroup = 1, kKeyboardGroup = 2, kAllGroups = kMouseGroup | kKeyboardGroup;
+// Corking right after the last sample would hold the still-buffered tail
+// until the next click; Windows stops its idle device after the same delay.
+constexpr auto kCorkDelay = std::chrono::milliseconds(400);
 struct FileDescriptor {
     explicit FileDescriptor(int descriptor) noexcept : value(descriptor) {}
     ~FileDescriptor() { if (value >= 0) close(value); }
@@ -208,6 +213,11 @@ struct AudioVoice {
     SourceWindow source;
     void Reset() noexcept { clip.reset(); at = 0; source.count = 0; keyboard = false; }
 };
+// Releases the voices of the given groups; the other group keeps playing.
+void ReleaseVoices(std::array<AudioVoice, kVoices>& voices, unsigned groups) noexcept {
+    for (auto& voice : voices)
+        if (voice.clip && (groups & (voice.keyboard ? kKeyboardGroup : kMouseGroup))) voice.Reset();
+}
 // Mouse and keyboard voices carry their own live gain. A muted group releases
 // its voices instead of mixing silence for the rest of a long clip.
 template<class ReportError>
@@ -258,7 +268,8 @@ struct PulseApi {
     PULSE_FUNCTION(pa_stream_connect_playback); PULSE_FUNCTION(pa_stream_set_state_callback);
     PULSE_FUNCTION(pa_stream_set_write_callback); PULSE_FUNCTION(pa_stream_get_state);
     PULSE_FUNCTION(pa_stream_writable_size); PULSE_FUNCTION(pa_stream_write);
-    PULSE_FUNCTION(pa_stream_flush); PULSE_FUNCTION(pa_operation_unref);
+    PULSE_FUNCTION(pa_stream_flush); PULSE_FUNCTION(pa_stream_cork);
+    PULSE_FUNCTION(pa_operation_unref);
 #undef PULSE_FUNCTION
     ~PulseApi() { if (library) dlclose(library); }
     bool Load() {
@@ -275,7 +286,7 @@ struct PulseApi {
         LOAD(pa_stream_connect_playback); LOAD(pa_stream_set_state_callback);
         LOAD(pa_stream_set_write_callback); LOAD(pa_stream_get_state);
         LOAD(pa_stream_writable_size); LOAD(pa_stream_write); LOAD(pa_stream_flush);
-        LOAD(pa_operation_unref);
+        LOAD(pa_stream_cork); LOAD(pa_operation_unref);
 #undef LOAD
         return true;
     }
@@ -287,8 +298,11 @@ std::string LowerAscii(std::string value) {
 } // namespace
 
 struct LinuxAudio::Impl {
-    std::atomic<bool> stopping{false}, running{false}, allowed{false}, enabled{false}, keyboardEnabled{false};
-    std::atomic<bool> settingsPending{false}, clearPending{false};
+    // allowed covers mouse sounds, keyboardAllowed key sounds; a hidden
+    // pointer only revokes the first.
+    std::atomic<bool> stopping{false}, running{false}, allowed{false}, keyboardAllowed{false}, enabled{false}, keyboardEnabled{false};
+    std::atomic<bool> settingsPending{false};
+    std::atomic<unsigned> clearGroups{0};
     std::atomic<unsigned> volume{75}, keyboardVolume{60};
     std::array<std::atomic<unsigned>, kQueueSlots> queued{};
     int wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -309,7 +323,8 @@ struct LinuxAudio::Impl {
     pa_context* context = nullptr;
     pa_stream* stream = nullptr;
     bool connectionFailed = false;
-    Clock::time_point retryAfter{};
+    bool corked = false; // The current stream is paused; it starts corked.
+    Clock::time_point retryAfter{}, idleSince{};
 
     ~Impl() { if (wake >= 0) close(wake); }
     void Wake() noexcept { const std::uint64_t one = 1; if (wake >= 0) { const auto ignored = write(wake, &one, sizeof(one)); (void)ignored; } }
@@ -342,12 +357,18 @@ struct LinuxAudio::Impl {
         Wake();
     }
     void EnqueueKey(unsigned slot) noexcept {
-        if (!running.load(std::memory_order_relaxed) || !allowed.load(std::memory_order_relaxed) || !keyboardVolume.load(std::memory_order_relaxed)) return;
+        if (!running.load(std::memory_order_relaxed) || !keyboardAllowed.load(std::memory_order_relaxed) || !keyboardVolume.load(std::memory_order_relaxed)) return;
         EnqueueSlot(slot);
         Wake();
     }
     static int Poll(struct pollfd* fds, unsigned long count, int timeout, void* userdata) {
         auto& self = *static_cast<Impl*>(userdata);
+        // An idle, still running stream needs one more pass to be corked.
+        if (self.idleSince != Clock::time_point{}) {
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(self.idleSince + kCorkDelay - Clock::now()).count();
+            const int limit = static_cast<int>(std::clamp<std::int64_t>(remaining, 0, kCorkDelay.count()));
+            timeout = timeout < 0 ? limit : std::min(timeout, limit);
+        }
         std::vector<pollfd> watched(count + 1);
         if (count) std::copy_n(fds, count, watched.begin());
         watched.back() = {self.wake, POLLIN, 0};
@@ -364,6 +385,7 @@ struct LinuxAudio::Impl {
     void CloseConnection() {
         if (stream) { pulse.pa_stream_set_write_callback_fn(stream, nullptr, nullptr); pulse.pa_stream_set_state_callback_fn(stream, nullptr, nullptr); pulse.pa_stream_disconnect_fn(stream); pulse.pa_stream_unref_fn(stream); stream = nullptr; }
         if (context) { pulse.pa_context_set_state_callback_fn(context, nullptr, nullptr); pulse.pa_context_disconnect_fn(context); pulse.pa_context_unref_fn(context); context = nullptr; }
+        corked = false; idleSince = {};
     }
     void DeviceFailure(const char* prefix) {
         deviceError = prefix;
@@ -382,7 +404,11 @@ struct LinuxAudio::Impl {
             self.pulse.pa_stream_set_state_callback_fn(self.stream, StreamChanged, &self);
             self.pulse.pa_stream_set_write_callback_fn(self.stream, WriteReady, &self);
             pa_buffer_attr buffer{19200, 3840, 0, 960, static_cast<std::uint32_t>(-1)};
-            if (self.pulse.pa_stream_connect_playback_fn(self.stream, nullptr, &buffer, PA_STREAM_ADJUST_LATENCY, nullptr, nullptr) < 0)
+            // prebuf 0 never stops on underrun by itself: the stream starts
+            // corked and is corked again whenever nothing plays.
+            self.corked = true;
+            const auto flags = static_cast<pa_stream_flags_t>(PA_STREAM_ADJUST_LATENCY | PA_STREAM_START_CORKED);
+            if (self.pulse.pa_stream_connect_playback_fn(self.stream, nullptr, &buffer, flags, nullptr, nullptr) < 0)
                 self.DeviceFailure("Could not start the sound stream");
             break;
         }
@@ -406,17 +432,39 @@ struct LinuxAudio::Impl {
         if (pulse.pa_context_connect_fn(context, nullptr, PA_CONTEXT_NOAUTOSPAWN, nullptr) < 0)
             DeviceFailure("PulseAudio/PipeWire sound output is unavailable");
     }
-    void Clear() {
-        for (auto& q : queued) q.store(0, std::memory_order_relaxed);
-        for (auto& voice : voices) voice.Reset();
-        if (stream && pulse.pa_stream_get_state_fn(stream) == PA_STREAM_READY) {
+    void Clear(unsigned groups = kAllGroups) {
+        for (unsigned slot = 0; slot < kQueueSlots; ++slot)
+            if (groups & (slot < kMouseSlots ? kMouseGroup : kKeyboardGroup)) queued[slot].store(0, std::memory_order_relaxed);
+        ReleaseVoices(voices, groups);
+        // Buffered audio of a group that keeps playing is not dropped.
+        if ((groups & kAllGroups) == kAllGroups && stream && pulse.pa_stream_get_state_fn(stream) == PA_STREAM_READY) {
             if (auto* op = pulse.pa_stream_flush_fn(stream, nullptr, nullptr)) pulse.pa_operation_unref_fn(op);
         }
     }
+    bool Playing() const noexcept {
+        return std::any_of(voices.begin(), voices.end(), [](const AudioVoice& voice) { return bool(voice.clip); });
+    }
+    void Cork(bool value) {
+        if (corked == value || !stream || pulse.pa_stream_get_state_fn(stream) != PA_STREAM_READY) return;
+        if (auto* op = pulse.pa_stream_cork_fn(stream, value, nullptr, nullptr)) pulse.pa_operation_unref_fn(op);
+        corked = value;
+    }
+    // A stream with nothing left to play is corked after a short grace, so the
+    // sound server can suspend the device; the next voice uncorks it.
+    void CorkWhenIdle() {
+        if (!stream || corked || Playing()) { idleSince = {}; return; }
+        const auto now = Clock::now();
+        if (idleSince == Clock::time_point{}) idleSince = now;
+        else if (now - idleSince >= kCorkDelay) { Cork(true); idleSince = {}; }
+    }
     void Feed() {
-        if (!allowed.load(std::memory_order_relaxed) || !stream || pulse.pa_stream_get_state_fn(stream) != PA_STREAM_READY) return;
+        if ((!allowed.load(std::memory_order_relaxed) && !keyboardAllowed.load(std::memory_order_relaxed)) ||
+            !stream || pulse.pa_stream_get_state_fn(stream) != PA_STREAM_READY) return;
         const auto now = Clock::now();
         for (auto& voice : voices) if (voice.clip && !voice.at && now - voice.queuedAt > std::chrono::milliseconds(250)) voice.Reset();
+        if (!Playing()) return;
+        idleSince = {};
+        Cork(false);
         std::size_t writable = pulse.pa_stream_writable_size_fn(stream);
         if (writable == static_cast<std::size_t>(-1)) return;
         std::array<std::int16_t, 960> output{};
@@ -499,7 +547,7 @@ struct LinuxAudio::Impl {
         return true;
     }
     void Commands() {
-        if (clearPending.exchange(false, std::memory_order_acquire)) Clear();
+        if (const unsigned groups = clearGroups.exchange(0, std::memory_order_acquire)) Clear(groups);
         if (settingsPending.exchange(false, std::memory_order_acquire)) {
             Settings next;
             { std::lock_guard<std::mutex> lock(mutex); next = pending; }
@@ -512,9 +560,14 @@ struct LinuxAudio::Impl {
             SetError();
             const bool mouseReady = next.clickSoundsEnabled && (clips[0] || clips[1] || clips[2]);
             const bool keyboardReady = next.keyboardSoundsEnabled && !keyVariants.empty();
+            // With both groups off nothing keeps a connection to the sound
+            // server; a preview reconnects on demand.
             if (mouseReady || keyboardReady) EnsureConnection();
+            else CloseConnection();
         }
-        if (!allowed.load(std::memory_order_relaxed)) return;
+        const bool mouseAllowed = allowed.load(std::memory_order_relaxed);
+        const bool keysAllowed = keyboardAllowed.load(std::memory_order_relaxed);
+        if (!mouseAllowed && !keysAllowed) return;
         if (!context && Clock::now() < retryAfter) {
             for (auto& q : queued) q.store(0, std::memory_order_relaxed);
             return; // Failed output must not accumulate old clicks for recovery.
@@ -522,6 +575,8 @@ struct LinuxAudio::Impl {
         bool added = false;
         for (unsigned slot = 0; slot < kQueueSlots; ++slot) {
             const auto count = std::min(queued[slot].exchange(0, std::memory_order_acquire), kVoices);
+            // A sound queued just before its group was paused stays silent.
+            if (!(slot < kMouseSlots ? mouseAllowed : keysAllowed)) continue;
             for (unsigned n = 0; n < count; ++n) {
                 bool ok = false;
                 if (slot < kMouseSlots) ok = AddVoice(clips[slot], slot, false);
@@ -543,6 +598,7 @@ struct LinuxAudio::Impl {
         while (!stopping.load(std::memory_order_acquire)) {
             Commands();
             if (connectionFailed) { CloseConnection(); connectionFailed = false; for (auto& v : voices) v.Reset(); }
+            CorkWhenIdle();
             if (stopping.load(std::memory_order_acquire)) break;
             if (loop) {
                 int result = 0;
@@ -563,7 +619,7 @@ LinuxAudio::~LinuxAudio() { Stop(); }
 bool LinuxAudio::Start(const Settings& settings, std::string& error) {
     Stop(); error.clear();
     if (impl_->wake < 0) { error = "Could not create the sound worker wake event."; return false; }
-    impl_->stopping.store(false); impl_->allowed.store(false);
+    impl_->stopping.store(false); impl_->allowed.store(false); impl_->keyboardAllowed.store(false);
     impl_->running.store(true);
     Update(settings);
     impl_->settingsPending.store(true, std::memory_order_release);
@@ -572,7 +628,7 @@ bool LinuxAudio::Start(const Settings& settings, std::string& error) {
     return true;
 }
 void LinuxAudio::Stop() noexcept {
-    impl_->allowed.store(false); impl_->stopping.store(true); impl_->Wake();
+    impl_->allowed.store(false); impl_->keyboardAllowed.store(false); impl_->stopping.store(true); impl_->Wake();
     if (impl_->thread.joinable()) impl_->thread.join();
     impl_->running.store(false);
 }
@@ -583,7 +639,8 @@ void LinuxAudio::Update(const Settings& settings) {
     const unsigned keyboardVolume = static_cast<unsigned>(std::clamp(settings.keyboardVolume, 0, 100));
     const bool gainChanged = impl_->volume.exchange(volume, std::memory_order_relaxed) != volume;
     const bool keyGainChanged = impl_->keyboardVolume.exchange(keyboardVolume, std::memory_order_relaxed) != keyboardVolume;
-    if ((gainChanged && !volume) || (keyGainChanged && !keyboardVolume)) impl_->clearPending.store(true, std::memory_order_release);
+    const unsigned muted = (gainChanged && !volume ? kMouseGroup : 0u) | (keyGainChanged && !keyboardVolume ? kKeyboardGroup : 0u);
+    if (muted) impl_->clearGroups.fetch_or(muted, std::memory_order_release);
     bool rebuild = false;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -598,9 +655,13 @@ void LinuxAudio::Update(const Settings& settings) {
     if (rebuild) impl_->settingsPending.store(true, std::memory_order_release);
     if (rebuild || gainChanged || keyGainChanged) impl_->Wake();
 }
-void LinuxAudio::SetAllowed(bool value) noexcept {
-    if (impl_->allowed.exchange(value, std::memory_order_acq_rel) == value) return;
-    if (!value) impl_->clearPending.store(true, std::memory_order_release);
+void LinuxAudio::SetAllowed(bool mouse, bool keyboard) noexcept {
+    const bool mouseBefore = impl_->allowed.exchange(mouse, std::memory_order_acq_rel);
+    const bool keyboardBefore = impl_->keyboardAllowed.exchange(keyboard, std::memory_order_acq_rel);
+    if (mouseBefore == mouse && keyboardBefore == keyboard) return;
+    // Only a revoked group stops: a hidden pointer cuts click sounds, never typing.
+    const unsigned revoked = (mouseBefore && !mouse ? kMouseGroup : 0u) | (keyboardBefore && !keyboard ? kKeyboardGroup : 0u);
+    if (revoked) impl_->clearGroups.fetch_or(revoked, std::memory_order_release);
     impl_->Wake();
 }
 void LinuxAudio::Click(unsigned mask) noexcept { if (impl_->enabled.load(std::memory_order_relaxed)) impl_->Enqueue(mask & 7u); }

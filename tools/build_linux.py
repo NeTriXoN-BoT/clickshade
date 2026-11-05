@@ -65,6 +65,15 @@ def main() -> int:
                         str(root / "tests/frame_pacing_test.cpp"), "-o", str(pacing_test),
                         *shlex.split(env.get("LDFLAGS", ""))], env=env, check=True)
         subprocess.run([str(pacing_test)], check=True)
+        # Header-only suites: no libraries, same set as CTest and build.sh.
+        for name, source in [("ui_scale_test", "tests/ui_scale_test.cpp"),
+                             ("game_detection_test", "linux/tests/game_detection_test.cpp")]:
+            binary = output.parent / name
+            subprocess.run([*cxx, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Wpedantic",
+                            *shlex.split(env.get("CXXFLAGS", "")), "-I", str(root / "src"), "-I", str(root / "linux"),
+                            str(root / source), "-o", str(binary),
+                            *shlex.split(env.get("LDFLAGS", ""))], env=env, check=True)
+            subprocess.run([str(binary)], check=True)
         settings_test = output.parent / "settings_test"
         glib_cflags = shlex.split(subprocess.check_output([pkg, "--cflags", "glib-2.0"], env=env, text=True))
         glib_libs = shlex.split(subprocess.check_output([pkg, "--libs", "glib-2.0"], env=env, text=True))

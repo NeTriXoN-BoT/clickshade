@@ -75,6 +75,41 @@ check(core.nextDeadline(1000, 1100, 500) === 1500 &&
     'frame deadlines retain normal timer phase and skip a stalled compositor backlog');
 check(core.effectiveRate(0, 144) === 144 && core.effectiveRate(0, NaN) === 60 &&
     core.effectiveRate(0, 500) === 360, 'automatic rate uses a valid bounded monitor refresh or 60 Hz fallback');
+check(core.BREATH_INTERVAL_US >= 30000 && core.BREATH_INTERVAL_US <= 40000,
+    'breathing has its own pace of about 30 repaints a second');
+{
+    const {typingHold, TYPING_START_US: start, TYPING_HOLD_US: hold} = core;
+    check(start === 1500000 && hold === 3000000, 'the typing hold starts within 1.5 s of a key and lasts 3 s past the last key');
+    check(typingHold(false, false, true, 1000, 1000 + start) && !typingHold(false, false, true, 1000, 1000 + start + 1) &&
+        !typingHold(false, false, true, 0, 5000),
+        'a pointer that hides soon after a key press starts a typing hold; a later or keyless hide does not');
+    check(typingHold(true, true, true, 1000, 1000 + hold - 1) && !typingHold(true, true, true, 1000, 1000 + hold) &&
+        !typingHold(false, true, true, 1000, 1100),
+        'the hold ends 3 s after the last key, and a pointer hidden before the key starts none');
+    check(!typingHold(true, true, false, 1000, 1100), 'showing the pointer ends the typing hold');
+}
+check(core.parseCommandLine('/usr/bin/demo\0--flag\0\0').join('|') === '/usr/bin/demo|--flag' &&
+    core.parseCommandLine('').length === 0, 'process command lines split on NUL bytes');
+{
+    const game = options => core.isGameWindow({home: '/home/test', ...options});
+    check(game({wmClass: 'steam_app_620'}) && game({wmClass: 'gamescope'}), 'Steam game classes and gamescope count as games');
+    check(game({exe: '/home/test/.local/share/Steam/steamapps/common/Portal 2/portal2_linux'}) &&
+        game({exe: '/mnt/games/SteamLibrary/SteamApps/common/Demo/demo.x86_64'}),
+        'programs in any Steam library folder count as games');
+    check(game({exe: '/opt/wine-staging/bin/wine64-preloader'}) && game({exe: '/usr/bin/wine-preloader'}) &&
+        game({argv: ['C:\\Program Files\\Demo\\demo.exe', '-windowed']}) && game({exe: '/usr/bin/gamescope'}),
+        'Wine/Proton processes and gamescope count as games');
+    check(game({exe: '/home/test/Games/Heroic/Demo/demo'}) && game({exe: '/srv/Games/Heroic/Demo/demo'}) &&
+        game({exe: '/home/test/.local/share/lutris/runners/retroarch/retroarch'}) &&
+        game({exe: '/home/test/.config/itch/apps/demo/demo.x86_64'}) && game({argv: ['/home/test/Games/demo/run.x86_64']}),
+        'programs in Heroic, Lutris and itch game folders count as games');
+    check(!game({wmClass: 'firefox', exe: '/usr/lib/firefox/firefox', argv: ['/usr/lib/firefox/firefox', 'https://example.com/setup.exe']}) &&
+        !game({wmClass: 'org.gnome.Totem', exe: '/usr/bin/totem'}) &&
+        !game({wmClass: 'libreoffice-impress', exe: '/usr/lib/libreoffice/program/soffice.bin'}) &&
+        !game({wmClass: 'steam', exe: '/home/test/.local/share/Steam/ubuntu12_32/steam'}) &&
+        !game({exe: '/opt/Heroic/heroic'}) && !game({}),
+        'browsers, video players, presentations and the game launchers themselves are no games');
+}
 
 let nextSignal = 1;
 class Signals {
@@ -107,6 +142,17 @@ function advance(milliseconds) {
     }
     now = until;
 }
+// Processes behind the mock windows: /proc/<pid>/exe and /proc/<pid>/cmdline.
+const home = '/home/test';
+const processes = new Map();
+let procReads = 0;
+function procEntry(path) {
+    ++procReads;
+    const [, pid, kind] = /^\/proc\/(\d+)\/(exe|cmdline)$/.exec(path) ?? [];
+    const value = processes.get(Number(pid))?.[kind];
+    if (value === undefined) throw new Error(`Cannot read ${path}`);
+    return value;
+}
 const GLib = {
     PRIORITY_DEFAULT: 0, SOURCE_REMOVE: false,
     get_monotonic_time: () => now,
@@ -115,9 +161,10 @@ const GLib = {
     },
     Source: {remove: id => timers.delete(id)},
     Variant: class { constructor(_signature, values) { this.values = values; } },
-    build_filenamev: parts => parts.join('/'), get_user_config_dir: () => '/test/config',
+    build_filenamev: parts => parts.join('/'), get_user_config_dir: () => '/test/config', get_home_dir: () => home,
     mkdir_with_parents: () => 0, path_get_basename: path => path.split('/').at(-1),
-    file_read_link: () => '/usr/bin/demo',
+    file_read_link: path => procEntry(path),
+    file_get_contents: path => [true, new TextEncoder().encode(procEntry(path))],
 };
 class Area extends Signals {
     constructor(properties) {
@@ -173,22 +220,65 @@ const file = {
         close_async() {},
     }),
 };
+// Session bus names and their watches. GDBus reports a watched name from the
+// main loop, never inside bus_watch_name; flushBus() runs that dispatch.
+const busNames = new Set([':1.42']), watchers = new Map(), busQueue = [];
+let watchId = 0, bridgeXml = '';
+function flushBus() { while (busQueue.length) busQueue.shift()(); }
+function dropBusName(name) {
+    busNames.delete(name);
+    for (const [id, watcher] of watchers)
+        if (watcher.name === name) busQueue.push(() => { if (watchers.has(id)) watcher.vanished(Gio.DBus.session, name); });
+    flushBus();
+}
 const Gio = {
     Cancellable: class { cancel() { this.cancelled = true; } },
     File: {new_for_path: () => file}, FileMonitorFlags: {NONE: 0},
-    DBus: {session: {}},
-    DBusExportedObject: {wrapJSObject: (_xml, object) => ({
-        export() { exported.push(object); },
-        unexport() { exported.splice(exported.indexOf(object), 1); },
-        emit_signal: (name, values) => emitted.push({name, values: values.values}),
-    })},
+    DBus: {session: {}}, BusNameWatcherFlags: {NONE: 0},
+    DBusExportedObject: {wrapJSObject: (xml, object) => {
+        bridgeXml = xml;
+        return {
+            export() { exported.push(object); },
+            unexport() { exported.splice(exported.indexOf(object), 1); },
+            emit_signal: (name, values) => emitted.push({name, values: values.values}),
+        };
+    }},
+    bus_watch_name_on_connection: (connection, name, _flags, appeared, vanished) => {
+        assert.equal(connection, Gio.DBus.session);
+        const id = ++watchId;
+        watchers.set(id, {name, appeared, vanished});
+        busQueue.push(() => {
+            if (!watchers.has(id)) return;
+            if (busNames.has(name)) appeared(connection, name, name); else vanished(connection, name);
+        });
+        return id;
+    },
+    bus_unwatch_name: id => assert.ok(watchers.delete(id), 'unwatch owns a bus name watch'),
 };
-const focus = new Signals(); focus.fullscreen = false;
-Object.assign(focus, {is_fullscreen: () => focus.fullscreen, get_pid: () => 42,
-    get_wm_class: () => 'Demo', get_gtk_application_id: () => 'org.test.Demo'});
+// Calls the exported bridge the way GJS does: a plain method wins over its
+// ...Async form, which receives the invocation and must answer through it.
+function bridge(method, args = [], sender = ':1.42') {
+    const object = exported.at(-1);
+    if (typeof object[method] === 'function') return object[method](...args);
+    assert.equal(typeof object[`${method}Async`], 'function', `the bridge handles ${method}`);
+    let reply;
+    object[`${method}Async`](args, {get_sender: () => sender, return_value: value => { reply = value; }});
+    return reply;
+}
+function makeWindow(pid, wmClass, exe, cmdline) {
+    const window = new Signals();
+    Object.assign(window, {fullscreen: false, wmClass, is_fullscreen: () => window.fullscreen, get_pid: () => pid,
+        get_wm_class: () => window.wmClass});
+    processes.set(pid, {exe, cmdline});
+    return window;
+}
+const demoPath = `${home}/.local/share/Steam/steamapps/common/Demo/demo`;
+const focus = makeWindow(42, 'Demo', demoPath, `${demoPath}\0-fullscreen\0`);
+focus.get_gtk_application_id = () => 'org.test.Demo';
 const stage = new Signals();
 const view = {get_refresh_rate: () => 144}; stage.get_view_at = () => view;
 const display = new Signals(); display.focus_window = focus;
+function focusWindow(window) { display.focus_window = window; display.emit('notify::focus-window'); }
 const tracker = new Signals(); tracker.visible = true;
 tracker.get_pointer_visible = () => tracker.visible;
 const idle = {id: 0, watches: new Map(),
@@ -218,11 +308,27 @@ vm.runInNewContext(source, sandbox, {filename: 'extension.js'});
 const extension = new sandbox.ClickShadeExtension();
 const clickSignals = () => emitted.filter(signal => signal.name === 'Click');
 const allowedSignals = () => emitted.filter(signal => signal.name === 'AllowedChanged');
+const mouseRule = () => emitted.filter(signal => signal.name === 'MouseAllowedChanged').at(-1).values[0];
 extension.enable();
 check(exported.length === 1 && extension.GetStatus()[1], 'enable exports the native GNOME bridge');
-check(allowedSignals().at(-1).values[0] === true,
-    'enable publishes the initial audio rule state to the native worker');
-check(actors.size === 1 && [...actors][0].visible, 'enable creates a small visible cached highlight');
+check(/<method name="SetActive"><arg name="active" type="b" direction="in"\/><\/method>/.test(bridgeXml) &&
+    /<method name="GetStatus">(\s*<arg name="\w+" type="[bs]" direction="out"\/>){5}\s*<\/method>/.test(bridgeXml) &&
+    ['Click', 'Key', 'AllowedChanged', 'MouseAllowedChanged'].every(name => bridgeXml.includes(`<signal name="${name}">`)),
+    'the bridge keeps the methods and signals the native app uses');
+check(extension.GetStatus().length === 5 &&
+    extension.GetStatus().every((value, index) => typeof value === (index < 2 ? 'boolean' : 'string')),
+    'GetStatus still answers with the (bbsss) reply the native app reads');
+check(actors.size === 0 && timers.size === 0 && !extension.GetStatus()[0] && extension.GetStatus()[2] === 'Paused',
+    'without the ClickShade app the extension draws and samples nothing');
+check(allowedSignals().at(-1).values[0] === false && mouseRule() === false,
+    'before the app activates the bridge no sound is allowed');
+check(bridge('SetActive', [true]) === null && extension.SetActive === undefined,
+    'SetActive is answered through its invocation, which names the calling app');
+flushBus();
+check(watchers.size === 1 && [...watchers.values()][0].name === ':1.42', 'the bus name of the activating app is watched');
+check(allowedSignals().at(-1).values[0] === true && mouseRule() === true,
+    'activation publishes the current audio rule state to the native worker');
+check(actors.size === 1 && [...actors][0].visible, 'activation creates a small visible cached highlight');
 check([...actors].every(actor => !actor.reactive && !actor.can_focus && !actor.track_hover),
     'all overlay actors remain nonreactive and cannot acquire keyboard focus');
 check(extension._rate === 240, 'manual high-refresh setting reaches the native scheduler');
@@ -271,7 +377,8 @@ check(extension._particles.length === 0 && clickSignals().length === beforeSound
     'left visual selection does not disable separately configured left click audio');
 configText += 'LeftClickEnabled=1\n'; extension.Reload();
 focus.fullscreen = true; display.emit('in-fullscreen-changed');
-check(!halo.visible && timers.size === 0, 'fullscreen pause hides actors and stops sampling');
+check(!halo.visible && timers.size === 0 && extension.GetStatus()[2] === 'Paused for a fullscreen game',
+    'a fullscreen game (a program in a Steam library) hides actors and stops sampling');
 check(allowedSignals().at(-1).values[0] === false,
     'fullscreen entry notifies the worker to flush existing audio voices');
 event(true); event(false);
@@ -294,6 +401,33 @@ focus.fullscreen = false; display.emit('in-fullscreen-changed');
 check(halo.visible, 'leaving fullscreen resumes the steady highlight');
 check(allowedSignals().at(-1).values[0] === true,
     'leaving fullscreen resumes audio eligibility');
+
+// Only games pause in fullscreen; browsers, video and presentations keep their effects.
+const editor = makeWindow(80, 'org.gnome.TextEditor', '/usr/bin/gnome-text-editor', '/usr/bin/gnome-text-editor\0/home/test/notes.txt\0');
+const readsBeforeEditor = procReads;
+focusWindow(editor);
+check(procReads === readsBeforeEditor + 1 && halo.visible, 'a windowed application has only its executable read, never its command line');
+const browser = makeWindow(77, 'firefox', '/usr/lib/firefox/firefox', '/usr/lib/firefox/firefox\0https://example.com/setup.exe\0');
+browser.fullscreen = true; focusWindow(browser);
+check(halo.visible && allowedSignals().at(-1).values[0] === true && !extension.GetStatus()[2].includes('Paused'),
+    'a fullscreen browser keeps its effects and sounds');
+const readsAfterFirstFocus = procReads;
+focusWindow(focus); focusWindow(browser); display.emit('in-fullscreen-changed');
+check(procReads === readsAfterFirstFocus && halo.visible, 'process details are read once per window');
+browser.wmClass = 'steam_app_620'; display.emit('in-fullscreen-changed');
+check(!halo.visible && procReads === readsAfterFirstFocus, 'a window class set after mapping is rechecked without rereading the process');
+const proton = makeWindow(78, 'demo.exe', undefined, 'Z:\\home\\test\\Games\\demo\\demo.exe\0');
+proton.fullscreen = true; focusWindow(proton);
+check(!halo.visible && allowedSignals().at(-1).values[0] === false,
+    'a fullscreen Wine/Proton program pauses even when its executable cannot be read');
+const presentation = makeWindow(79, 'libreoffice-impress', '/usr/lib/libreoffice/program/soffice.bin', '/usr/lib/libreoffice/program/soffice.bin\0--impress\0');
+presentation.fullscreen = true; focusWindow(presentation);
+check(halo.visible, 'a fullscreen presentation keeps its effects');
+configText += 'PauseFullscreen=0\n'; extension.Reload(); focusWindow(proton);
+check(halo.visible, 'switching the fullscreen pause off keeps effects over fullscreen games');
+configText += 'PauseFullscreen=1\n'; extension.Reload();
+focusWindow(focus);
+check(halo.visible, 'returning to a windowed game resumes the effects');
 configText += 'ExcludedProcesses=demo\n'; extension.Reload();
 check(!halo.visible && extension.GetStatus()[2].includes('excluded'),
     'foreground executable/application exclusions suppress effects');
@@ -333,12 +467,38 @@ check(keySignals().length === keysBefore + 2 && keySignals().at(-2).values[0] ==
 focus.fullscreen = true; display.emit('in-fullscreen-changed'); keyEvent(0x20);
 check(keySignals().length === keysBefore + 2, 'paused rules also silence keyboard notifications');
 focus.fullscreen = false; display.emit('in-fullscreen-changed');
+// Editors hide the pointer while you type: keyboard sounds keep playing.
+tracker.visible = false; tracker.emit('visibility-changed');
+keyEvent(0x61);
+check(keySignals().length === keysBefore + 3 && allowedSignals().at(-1).values[0] === true && mouseRule() === false,
+    'a hidden pointer keeps keyboard sounds and their audio rule; only the mouse rule turns off');
+const clicksWhileHidden = clickSignals().length; event(true); event(false);
+check(clickSignals().length === clicksWhileHidden && !halo.visible,
+    'a hidden pointer silences click notifications and hides the highlight');
+tracker.visible = true; tracker.emit('visibility-changed');
+check(mouseRule() === true && halo.visible, 'the mouse rule and the highlight return with the pointer');
 configText += 'KeyboardSoundsEnabled=0\n'; extension.Reload(); keyEvent(0x20);
-check(keySignals().length === keysBefore + 2, 'keyboard notifications stop as soon as keyboard sounds are off');
+check(keySignals().length === keysBefore + 3, 'keyboard notifications stop as soon as keyboard sounds are off');
+configText += 'HighlightEnabled=0\nClickEffectsEnabled=0\nClickSoundsEnabled=0\nKeyboardSoundsEnabled=1\n'; extension.Reload();
+keyEvent(0x61); advance(100);
+check(extension._timer === 0 && !halo.visible && keySignals().length === keysBefore + 4,
+    'keyboard sounds alone never run the pointer sampling timer');
+configText += 'HighlightEnabled=1\nClickEffectsEnabled=1\nClickSoundsEnabled=1\nKeyboardSoundsEnabled=0\n'; extension.Reload();
+check(halo.visible && extension._timer !== 0, 'switching a pointer effect back on resumes sampling');
 configText += 'HighlightBreathing=1\n'; extension.Reload();
-const breathingPaints = halo.paintCount;
-advance(50);
-check(halo.paintCount > breathingPaints, 'a breathing highlight repaints while it swells');
+let breathingPaints = halo.paintCount;
+advance(1000);
+const breathsWhileSampling = halo.paintCount - breathingPaints;
+check(breathsWhileSampling >= 28 && breathsWhileSampling <= 32,
+    'a breathing highlight repaints about 30 times a second while sampling runs at 240 Hz');
+const idleBreath = [...idle.watches.values()].find(watch => watch.idle);
+idleBreath.callback();
+const callbacksBeforeIdle = callbacks; breathingPaints = halo.paintCount;
+advance(1000);
+check(callbacks - callbacksBeforeIdle <= 32 && halo.paintCount - breathingPaints >= 28 && halo.visible,
+    'an idle breathing highlight wakes only at the pace of the breath');
+const breathResume = [...idle.watches].find(([, watch]) => !watch.idle);
+idle.watches.delete(breathResume[0]); breathResume[1].callback();
 configText += 'HighlightBreathing=0\nHighlightIdleHideMs=1500\n'; extension.Reload(); advance(500);
 check(halo.visible, 'the highlight stays visible while the pointer rested for less than the idle limit');
 advance(1200);
@@ -431,7 +591,13 @@ check(!extension._keyStack.visible, 'fullscreen pause hides the key display');
 keyPress(0x73, 4, 0x13);
 check(!extension._keyStack.visible, 'paused rules ignore key presses');
 focus.fullscreen = false; display.emit('in-fullscreen-changed');
+configText += 'HighlightEnabled=0\nClickEffectsEnabled=0\nClickSoundsEnabled=0\n'; extension.Reload();
+keyPress(0xffc2, 0); advance(100);
+check(extension._timer === 0 && extension._keyStack.visible && rowTexts().at(-1) === 'F5',
+    'the key display without mouse buttons never samples the pointer');
 configText += 'KeyDisplayMouse=1\n'; extension.Reload();
+check(extension._timer !== 0, 'mouse buttons in the key display need the pointer sampling');
+configText += 'HighlightEnabled=1\nClickEffectsEnabled=1\nClickSoundsEnabled=1\n'; extension.Reload();
 event(true); event(false);
 check(extension._keyStack.visible && rowTexts().at(-1) === 'Left click', 'mouse buttons are labelled when that switch is on');
 configText += 'KeyDisplayEnabled=0\nKeyDisplayMouse=0\n'; extension.Reload();
@@ -445,9 +611,34 @@ check(extension._lens.x > pointer.x && extension._lens.y + lensSize < pointer.y,
 check(extension._lensClone.source === global.window_group && extension._lensClone.scaleX === 3 &&
     extension._lensClone.x === Math.round(lensSize / 2 - 400 * 3) && extension._lensClone.y === Math.round(lensSize / 2 - 600 * 3),
     'the lens clones the window layer scaled so the pointer position sits at its center');
+// Hidden pointer: every pointer effect hides, except the lens during a typing hold.
+advance(1600);
 tracker.visible = false; tracker.emit('visibility-changed');
-check(extension._lens.visible, 'a hidden pointer (typing) keeps the lens where it is');
+check(!extension._lens.visible && !halo.visible && extension._typingTimer === 0,
+    'a pointer hidden without recent typing hides the lens with every other pointer effect');
 tracker.visible = true; tracker.emit('visibility-changed');
+check(extension._lens.visible && halo.visible, 'the lens and the highlight return with the pointer');
+keyPress(0x61, 0, 0x61); advance(500);
+tracker.visible = false; tracker.emit('visibility-changed');
+check(extension._lens.visible && !halo.visible && timers.size === 1,
+    'a pointer that hides right after a key press is a typing hold: the lens stays, the highlight hides, sampling stops');
+advance(2000); keyPress(0x62, 0, 0x62); advance(2500);
+check(extension._lens.visible, 'each key press extends the typing hold');
+advance(600);
+check(!extension._lens.visible && extension._typingTimer === 0 && timers.size === 0,
+    'about 3 s without a key ends the hold and hides the lens');
+keyPress(0x63, 0, 0x63);
+check(!extension._lens.visible, 'typing while the pointer stays hidden starts no new hold');
+tracker.visible = true; tracker.emit('visibility-changed');
+check(extension._lens.visible, 'the lens returns when the pointer shows again');
+keyPress(0x61, 0, 0x61); advance(1600);
+tracker.visible = false; tracker.emit('visibility-changed');
+check(!extension._lens.visible, 'a pointer that hides more than 1.5 s after the last key is no typing hold');
+tracker.visible = true; tracker.emit('visibility-changed');
+keyPress(0x61, 0, 0x61);
+tracker.visible = false; tracker.emit('visibility-changed');
+tracker.visible = true; tracker.emit('visibility-changed');
+check(extension._lens.visible && extension._typingTimer === 0, 'showing the pointer ends the hold and its timer');
 focus.fullscreen = true; display.emit('in-fullscreen-changed');
 check(!extension._lens.visible, 'other pauses hide the lens');
 focus.fullscreen = false; display.emit('in-fullscreen-changed');
@@ -458,13 +649,14 @@ check(extension._lens.visible && /border: none/.test(extension._lens.style), 'sw
 configText += 'MagnifierEnabled=0\n'; extension.Reload(); advance(25);
 check(!extension._lens.visible, 'switching the magnifier off hides the lens');
 pointer.x = 310; pointer.y = 240; advance(25); // Back where the earlier checks left the mock pointer.
-extension.SetActive(false);
-check(!halo.visible && timers.size === 0, 'the GTK bridge can pause without disabling or modifying the real pointer');
-extension.SetActive(true);
+bridge('SetActive', [false]);
+check(!halo.visible && timers.size === 0 && watchers.size === 0,
+    'the GTK bridge can pause without disabling or modifying the real pointer, and stops watching the app');
+bridge('SetActive', [true]); flushBus();
 const ruleSignalsBeforeReconnect = allowedSignals().length;
-extension.SetActive(true);
-check(allowedSignals().length === ruleSignalsBeforeReconnect + 1 && allowedSignals().at(-1).values[0],
-    'a reconnecting GTK process receives the unchanged current audio rule state');
+bridge('SetActive', [true]); flushBus();
+check(allowedSignals().length === ruleSignalsBeforeReconnect + 1 && allowedSignals().at(-1).values[0] && watchers.size === 1,
+    'a reconnecting GTK process receives the unchanged current audio rule state and keeps a single watch');
 const idleEntry = [...idle.watches.values()].find(watch => watch.idle);
 idleEntry.callback();
 check(timers.size === 0 && halo.visible, 'idle observation retains the highlight but stops repeating sampling');
@@ -472,14 +664,45 @@ const activeEntry = [...idle.watches].find(([, watch]) => !watch.idle);
 idle.watches.delete(activeEntry[0]); activeEntry[1].callback();
 check(timers.size === 1, 'the one-shot user-active watch resumes sampling after idle');
 extension.Restore();
-check(extension.GetStatus()[0] === false && timers.size === 0, 'Restore clears visuals and pauses the extension');
-extension.SetActive(true);
+check(extension.GetStatus()[0] === false && timers.size === 0 && watchers.size === 0, 'Restore clears visuals and pauses the extension');
+bridge('SetActive', [true]); flushBus();
+check(halo.visible && extension.GetStatus()[0], 'the app can resume the effects after Restore');
+
+// The app quits, crashes or is killed without SetActive(false).
+dropBusName(':1.42');
+check(!halo.visible && timers.size === 0 && !extension.GetStatus()[0] && watchers.size === 0 &&
+    allowedSignals().at(-1).values[0] === false && mouseRule() === false,
+    'effects and sounds stop when the app that activated them leaves the bus');
+event(true); event(false); keyEvent(0x20);
+check(extension._particles.length === 0 && !halo.visible && !extension._lens.visible, 'no effect starts after the app has gone');
+busNames.add(':1.43');
+bridge('SetActive', [true], ':1.43'); flushBus();
+check(halo.visible && extension.GetStatus()[0] && [...watchers.values()][0].name === ':1.43',
+    'a newly started app activates the effects again');
+
+// The lock screen disables the extension and enables it again afterwards.
 extension.disable();
-check(allowedSignals().at(-1).values[0] === false,
+check(watchers.size === 0 && actors.size === 0 && timers.size === 0, 'disable also removes the watch of the app');
+extension.enable();
+check(!extension.GetStatus()[0] && actors.size === 0, 'a re-enabled extension first checks that its app still runs');
+flushBus();
+check(extension.GetStatus()[0] && extension._highlight?.actor.visible && allowedSignals().at(-1).values[0] === true,
+    'after the lock screen the effects resume while the app that activated them still runs');
+extension.disable();
+dropBusName(':1.43');
+extension.enable(); flushBus();
+check(!extension.GetStatus()[0] && actors.size === 0 && watchers.size === 0,
+    'an app that quit while the extension was disabled does not resume the effects');
+busNames.add(':1.44');
+bridge('SetActive', [true], ':1.44'); flushBus();
+check(extension._highlight?.actor.visible, 'the next app start activates them as usual');
+extension.disable();
+check(allowedSignals().at(-1).values[0] === false && mouseRule() === false,
     'disable stops active audio before unexporting the bridge');
-check(actors.size === 0 && timers.size === 0 && exported.length === 0,
-    'disable destroys every actor, timer, and exported D-Bus object');
-check([stage, display, layout, tracker, theme, session, focus, monitor].every(object => object.signals.size === 0) &&
+check(actors.size === 0 && timers.size === 0 && exported.length === 0 && watchers.size === 0,
+    'disable destroys every actor, timer, bus name watch, and exported D-Bus object');
+check([stage, display, layout, tracker, theme, session, focus, editor, browser, proton, presentation, monitor]
+    .every(object => object.signals.size === 0) &&
     idle.watches.size === 0 && monitor.cancelled, 'disable disconnects signals, idle watches and the file monitor');
 check(pointer.x === 310 && pointer.y === 240 && pointer.modifiers === 0,
     'the extension never rewrites pointer position, visibility, theme, or button state');

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -39,7 +40,7 @@ constexpr int kValueOffset = 1000;   // Slider id + offset = its numeric edit bo
 constexpr int kResetOffset = 2000;   // Slider id + offset = its reset button.
 constexpr int kCardResetBase = 700;  // Pool of per-card Reset buttons.
 constexpr int kCardResetCount = 16;
-constexpr int kNavIconBase = 760;
+constexpr int kSpectrumGlow = 5;     // Pixel rows of glow above and below the 2 px spectrum line.
 
 // Layout constants in DIP.
 constexpr int kSidebarWidth = 184;
@@ -93,7 +94,7 @@ inline COLORREF FromHsv(double hue, double saturation, double value) noexcept {
 }
 
 struct Palette {
-    COLORREF background{}, sidebar{}, card{}, cardHover{}, border{}, edit{}, text{}, muted{}, accent{}, accentText{}, accentInk{}, warning{}, success{};
+    COLORREF background{}, sidebar{}, card{}, border{}, edit{}, text{}, muted{}, accent{}, accentText{}, accentInk{}, warning{}, success{};
     bool dark = true;
     Palette() = default;
     explicit Palette(const Settings& settings) {
@@ -102,7 +103,6 @@ struct Palette {
         const COLORREF contrast = dark ? RGB(255, 255, 255) : RGB(0, 0, 0);
         sidebar = Mix(background, contrast, dark ? .025 : .035);
         card = Mix(background, contrast, dark ? .05 : .03);
-        cardHover = Mix(background, contrast, dark ? .08 : .05);
         border = Mix(background, contrast, dark ? .15 : .16);
         edit = Mix(background, contrast, dark ? .085 : .06);
         text = dark ? RGB(234, 239, 247) : RGB(22, 28, 38);
@@ -255,7 +255,7 @@ std::wstring PathLeaf(const std::wstring& path);
 // Items the layout computes once and the panel paints every frame. All
 // coordinates are DIP relative to the scrolled content origin.
 struct PaintText { std::wstring text; RECT rect; int font; COLORREF color; UINT flags; };
-struct PaintFrame { RECT rect; int radius; bool card; };
+struct PaintFrame { RECT rect; int radius; };
 enum FontKind { FontNormal = 0, FontSmall, FontSemibold, FontTitle, FontCount };
 
 struct App {
@@ -291,6 +291,7 @@ struct App {
     int page = 0;
     std::array<COLORREF, 16> customColors{};
     bool started = false, exiting = false, hotkeyAvailable = false, elevated = false;
+    bool elevatedStartupAllowed = false; // ExecutableLocationProtected(), checked once at start.
     bool pressedAutomatically = false, hotkeyDraftDirty = false;
     int capturingShortcut = -1;
     bool suppressShortcutCharacters = false;
@@ -309,6 +310,11 @@ struct App {
     double spectrumPhase = 0.0;
     ULONGLONG spectrumLast = 0;
     bool spectrumTimerArmed = false;
+    // The spectrum strip's DIB and memory DC, kept while the width stays.
+    HDC spectrumDc = nullptr;
+    HBITMAP spectrumBitmap = nullptr, spectrumOriginal = nullptr;
+    std::uint32_t* spectrumPixels = nullptr;
+    int spectrumWidth = 0;
 
     ~App();
     int S(int value) const { return MulDiv(value, dpi, 96); }
@@ -351,6 +357,9 @@ struct App {
     void DrawButton(const DRAWITEMSTRUCT* item);
     void DrawToggle(HWND child, HDC dc);
     void DrawSpectrum(HDC dc, const RECT& line);
+    RECT SpectrumBand() const; // Window client pixels the animated line repaints.
+    bool PaintSpectrumBand(HDC dc, const RECT& dirty);
+    void FreeSpectrumStrip();
     void DrawNavGlyph(HDC dc, int pageIndex, int x, int y, int size, COLORREF ink);
     void ApplyTheme();
     void StartSpectrum();

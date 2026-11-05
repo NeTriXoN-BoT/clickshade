@@ -6,6 +6,22 @@
 #include <windowsx.h>
 #include <cwchar>
 
+#if defined(__MINGW32__) && defined(_WIN64)
+// MSVC builds set this with /DEPENDENTLOADFLAG. For MinGW and Zig the image's
+// load configuration tells Windows 10 1607 and later to resolve the static
+// imports (winmm, dwmapi, uxtheme and the rest) from System32 only, never from
+// the folder ClickShade.exe was extracted to. tools/build_zig.py checks it.
+namespace {
+constexpr IMAGE_LOAD_CONFIG_DIRECTORY SystemImportsOnly() {
+    IMAGE_LOAD_CONFIG_DIRECTORY config{};
+    config.Size = sizeof(config);
+    config.DependentLoadFlags = LOAD_LIBRARY_SEARCH_SYSTEM32;
+    return config;
+}
+} // namespace
+extern "C" constexpr IMAGE_LOAD_CONFIG_DIRECTORY _load_config_used = SystemImportsOnly();
+#endif
+
 namespace clickshade::ui {
 
 LRESULT CALLBACK ToggleProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id, DWORD_PTR data) {
@@ -195,9 +211,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         case WM_CREATE: {
             if (const UINT actualDpi = GetDpiForWindow(window)) app->systemDpi = static_cast<int>(actualDpi);
             // Lower-integrity instances (a second launch, --restore, --quit)
-            // must still reach an elevated settings window.
-            for (UINT allowed : {kShowSettings, kRestoreAndPause, kQuitRequest})
-                ChangeWindowMessageFilterEx(window, allowed, MSGFLT_ALLOW, nullptr);
+            // must still reach an elevated settings window, and so must
+            // Explorer's TaskbarCreated broadcast after it restarts.
+            for (UINT allowed : {kShowSettings, kRestoreAndPause, kQuitRequest, app->taskbarCreated})
+                if (allowed) ChangeWindowMessageFilterEx(window, allowed, MSGFLT_ALLOW, nullptr);
             app->Scale(false);
             app->panel = CreateWindowExW(WS_EX_CONTROLPARENT, kPanelClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                 0, 0, 10, 10, window, nullptr, GetModuleHandleW(nullptr), app);
@@ -216,7 +233,9 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
             if (buffer) {
                 const int saved = SaveDC(buffer);
                 IntersectClipRect(buffer, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
-                app->Paint(buffer); RestoreDC(buffer, saved);
+                // The animated line invalidates only its own band 30 times a second.
+                if (!app->PaintSpectrumBand(buffer, ps.rcPaint)) app->Paint(buffer);
+                RestoreDC(buffer, saved);
                 BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
                     buffer, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
             } else app->Paint(dc);
@@ -269,8 +288,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
         case kRestoreAndPause: app->RestoreAndPause(); return 0;
         case kQuitRequest: app->Exit(); return 0;
         case kTrayMessage:
-            if (LOWORD(lparam) == NIN_SELECT || LOWORD(lparam) == NIN_KEYSELECT || LOWORD(lparam) == WM_LBUTTONUP) app->Show();
-            else if (LOWORD(lparam) == WM_CONTEXTMENU || LOWORD(lparam) == WM_RBUTTONUP) app->TrayMenu();
+            // Version 4 icons report a click both as the raw button message and
+            // as NIN_SELECT or WM_CONTEXTMENU; only the latter (which also cover
+            // the keyboard) act, so one click opens one window or menu.
+            if (LOWORD(lparam) == NIN_SELECT || LOWORD(lparam) == NIN_KEYSELECT) app->Show();
+            else if (LOWORD(lparam) == WM_CONTEXTMENU) app->TrayMenu();
             return 0;
         case WM_CLOSE: app->CancelShortcutCapture(); app->FlushSettings(); ShowWindow(window, SW_HIDE); app->StopSpectrum(); return 0;
         case WM_QUERYENDSESSION: return TRUE;
@@ -348,6 +370,17 @@ HWND FindRunningInstance(DWORD timeoutMs = 0) {
         Sleep(50);
     }
 }
+
+// The running instance sits in the tray, so Windows only lets it take the
+// foreground when this launch, which the user just started, hands that over.
+void ShowRunningInstance() {
+    HWND existing = FindRunningInstance(3000);
+    if (!existing) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(existing, &pid);
+    if (pid) AllowSetForegroundWindow(pid);
+    PostMessageW(existing, kShowSettings, 0, 0);
+}
 } // namespace
 } // namespace clickshade::ui
 
@@ -377,6 +410,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (existing) PostMessageW(existing, kQuitRequest, 0, 0);
         return existing ? 0 : 1;
     }
+    // Task Scheduler starts tasks below normal priority, and the elevated
+    // startup task of older builds kept that level. The effects have to keep
+    // up with the pointer, and a crash restart would inherit the class.
+    if (arguments.tray && GetPriorityClass(GetCurrentProcess()) == BELOW_NORMAL_PRIORITY_CLASS)
+        SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
     WaitForReplacedProcess(arguments.replacePid);
 
     CrashGuardOptions crashOptions;
@@ -384,28 +422,39 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     InstallCrashGuard(crashOptions);
 
     // One instance per desktop session. A second launch, whatever its version
-    // or folder, only brings the running settings window to the front.
+    // or folder, only brings the running settings window to the front. An
+    // unelevated launch cannot open an elevated instance's mutex at all, and
+    // that also means ClickShade is already running.
     HANDLE singleton = CreateMutexW(nullptr, TRUE, L"Local\\ClickShade.Instance.v1");
-    if (!singleton) return 1;
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND existing = FindRunningInstance(3000)) PostMessageW(existing, kShowSettings, 0, 0);
-        CloseHandle(singleton); return 0;
+    const DWORD singletonError = GetLastError();
+    if (!singleton && singletonError != ERROR_ACCESS_DENIED) return 1;
+    if (!singleton || singletonError == ERROR_ALREADY_EXISTS) {
+        ShowRunningInstance();
+        if (singleton) CloseHandle(singleton);
+        return 0;
     }
     INITCOMMONCONTROLSEX common{sizeof(common), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&common);
     App app;
     app.elevated = IsProcessElevated();
-    app.crashNotice = TakeCrashNotice();
+    app.elevatedStartupAllowed = ExecutableLocationProtected();
     // Administrator mode relaunches before any window exists so the user sees
-    // one prompt and one window. A declined prompt continues unelevated.
+    // one prompt and one window. A declined prompt continues unelevated. The
+    // tray start and the crash-restart count travel with the relaunch.
     if (app.settings.runAsAdministrator && !app.elevated && !arguments.noElevate) {
-        std::wstring error;
+        std::wstring error, forwarded = arguments.tray ? L"--tray" : L"";
+        if (arguments.afterCrash)
+            forwarded += (forwarded.empty() ? L"--after-crash " : L" --after-crash ") + std::to_wstring(arguments.afterCrash);
         ReleaseMutex(singleton); CloseHandle(singleton); singleton = nullptr;
-        if (RelaunchElevated(error)) return 0;
+        if (RelaunchElevated(error, forwarded)) return 0;
         singleton = CreateMutexW(nullptr, TRUE, L"Local\\ClickShade.Instance.v1");
         if (!singleton || GetLastError() == ERROR_ALREADY_EXISTS) { if (singleton) CloseHandle(singleton); return 0; }
         app.compatibilityNote = error + L" Effects over administrator windows stay limited this session.";
     }
+    // Read (and remove) the crash notice only in the instance that shows it,
+    // before the first layout so the About card already carries the note.
+    app.crashNotice = TakeCrashNotice();
+    if (app.crashNotice.present) app.page = kAppearancePage;
     HDC screen = GetDC(nullptr); app.systemDpi = GetDeviceCaps(screen, LOGPIXELSX); ReleaseDC(nullptr, screen); app.Scale(false);
     app.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSEXW panelClass{}; panelClass.cbSize = sizeof(panelClass);
@@ -437,7 +486,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     app.Layout();
     SetTimer(window, kHealthyTimer, 90000, nullptr);
     if ((!arguments.tray && !app.settings.startMinimized) || !app.started || app.crashNotice.present) {
-        if (app.crashNotice.present) app.page = kAppearancePage; // Show the recovery note on About.
         ShowWindow(window, SW_SHOWNORMAL); UpdateWindow(window);
         app.StartSpectrum();
     }

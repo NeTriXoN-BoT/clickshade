@@ -4,6 +4,7 @@
 // These checks validate data, bounds and asynchronous diagnostics. They do not
 // claim that an output device played an audible sound.
 #include "../src/click_audio.cpp"
+#include <winioctl.h>
 #include <cstdio>
 #include <functional>
 #include <stdexcept>
@@ -123,21 +124,30 @@ int wmain() {
               "late sound samples stream correctly through a bounded source window");
         Check(sizeof(windowed.bytes) == 65536, "per-voice source window is bounded at64KiB");
         auto sparseHeader = Wave(WAVE_FORMAT_PCM, 1, 48000, 16, {});
-        constexpr std::uint32_t longFrames = 48000u * 3600u;
+        TempFile sparse(sparseHeader);
+        HANDLE largeFile = CreateFileW(sparse.path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        // Without the sparse flag NTFS zero-fills the skipped range, about
+        // 345 MB per run. Where the temporary folder cannot hold sparse files
+        // (FAT32, exFAT) a one-minute clip keeps the same bounded-prefix check.
+        DWORD returned = 0;
+        const bool sparseSupported = largeFile != INVALID_HANDLE_VALUE &&
+            DeviceIoControl(largeFile, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr);
+        if (!sparseSupported) std::puts("NOTE Sparse files are unavailable in the temporary folder; using a one-minute clip.");
+        const std::uint32_t longFrames = sparseSupported ? 48000u * 3600u : 48000u * 60u;
         const auto replace32 = [](std::vector<std::uint8_t>& data, std::size_t offset, std::uint32_t value) {
             for (unsigned i = 0; i < 4; ++i) data[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
         };
         replace32(sparseHeader, 4, 36 + longFrames * 2);
         replace32(sparseHeader, 40, longFrames * 2);
-        TempFile sparse(sparseHeader);
-        HANDLE largeFile = CreateFileW(sparse.path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         LARGE_INTEGER end{}; end.QuadPart = 44 + static_cast<LONGLONG>(longFrames - 1) * 2;
-        DWORD written = 0;
+        DWORD written = 0, headerWritten = 0;
         const unsigned char marker[]{0xff,0x7f};
-        const bool sparseWritten = largeFile != INVALID_HANDLE_VALUE && SetFilePointerEx(largeFile, end, nullptr, FILE_BEGIN) &&
+        const bool sparseWritten = largeFile != INVALID_HANDLE_VALUE &&
+            WriteFile(largeFile, sparseHeader.data(), static_cast<DWORD>(sparseHeader.size()), &headerWritten, nullptr) &&
+            headerWritten == sparseHeader.size() && SetFilePointerEx(largeFile, end, nullptr, FILE_BEGIN) &&
             WriteFile(largeFile, marker, 2, &written, nullptr) && written == 2;
         if (largeFile != INVALID_HANDLE_VALUE) CloseHandle(largeFile);
-        Check(sparseWritten, "one-hour sparse WAV fixture is prepared without duration-sized RAM");
+        Check(sparseWritten, "one-hour sparse WAV fixture is prepared without duration-sized RAM or disk");
         clickshade::MediaDecoder decoder;
         std::atomic<bool> cancelled{false};
         auto hour = clickshade::DecodeFile(sparse.path, decoder, cancelled, error);

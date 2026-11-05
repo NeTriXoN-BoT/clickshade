@@ -1,10 +1,13 @@
 // Interactive integration checks. This temporarily moves the mouse, clips it,
-// hides it, and changes the test window to fullscreen. Use a test desktop.
+// hides it, changes the test window to fullscreen and opens a fullscreen test
+// "game" (a copy of this program in a Steam library folder under %TEMP%).
+// Use a test desktop.
 #include "runtime.h"
 #include "input_access.h"
 
 #include <windows.h>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cwchar>
 #include <cmath>
@@ -17,6 +20,7 @@ unsigned legacyLeftDown = 0, legacyLeftUp = 0;
 unsigned legacyRightDown = 0, legacyRightUp = 0;
 unsigned statusNotifications = 0;
 clickshade::Runtime* notificationRuntime = nullptr;
+HCURSOR forcedCursor = nullptr; // Kept on the test window while set (see WM_SETCURSOR).
 constexpr UINT_PTR kMoveProbeTimer = 81;
 struct MoveProbe {
     clickshade::Runtime* runtime = nullptr;
@@ -78,16 +82,23 @@ OverlayInfo Overlays() {
 
 void Describe(clickshade::Runtime& runtime, const char* stage) {
     const auto state = runtime.Snapshot();
-    std::printf("STATE %s: ready=%d pressed=%d held=%u fullscreen=%d confined=%d paused=%d overlays=%u\n",
-        stage, state.ready, state.pressed, state.heldButtons, state.fullscreen,
+    std::printf("STATE %s: ready=%d pressed=%d held=%u fullscreen=%d game=%d confined=%d paused=%d overlays=%u\n",
+        stage, state.ready, state.pressed, state.heldButtons, state.fullscreen, state.fullscreenGame,
         state.cursorConfined, state.pausedByRule, Overlays().visible);
     std::wprintf(L"  %ls | error=%ls | visuals=%ls | audio=%ls\n",
         state.stateText.c_str(), state.lastError.c_str(),
         state.visualError.c_str(), state.audioError.c_str());
+    RECT clip{}; GetClipCursor(&clip);
+    POINT pointer{}; GetCursorPos(&pointer);
+    std::wprintf(L"  clip=%ld,%ld,%ld,%ld pointer=%ld,%ld foreground=%p\n", clip.left, clip.top, clip.right, clip.bottom,
+                 pointer.x, pointer.y, static_cast<void*>(GetForegroundWindow()));
 }
 
 LRESULT CALLBACK ProbeWindow(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_SETCURSOR:
+        if (forcedCursor && LOWORD(lParam) == HTCLIENT) { SetCursor(forcedCursor); return TRUE; }
+        break;
     case WM_LBUTTONDOWN: ++legacyLeftDown; break;
     case WM_LBUTTONUP: ++legacyLeftUp; break;
     case WM_RBUTTONDOWN: ++legacyRightDown; break;
@@ -202,6 +213,118 @@ void ShakeMouse(HWND window) {
     Pump(240);
 }
 
+// The runtime's hidden input window in this process.
+HWND RuntimeInputWindow() {
+    HWND found = nullptr;
+    while ((found = FindWindowExW(nullptr, found, L"ClickShade.InputWindow.v1", nullptr)) != nullptr) {
+        DWORD process = 0;
+        GetWindowThreadProcessId(found, &process);
+        if (process == GetCurrentProcessId()) return found;
+    }
+    return nullptr;
+}
+
+// Child mode: one fullscreen window on the pointer's monitor until the
+// parent signals the event (or a minute passes). Then the test window gets
+// the foreground back, which only the foreground process can hand over.
+int GameWindow(const wchar_t* eventName, const wchar_t* ownerText) {
+    HWND owner = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(std::wcstoull(ownerText, nullptr, 16)));
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    HANDLE stop = OpenEventW(SYNCHRONIZE, FALSE, eventName);
+    if (!stop) return 2;
+    WNDCLASSW windowClass{};
+    windowClass.lpfnWndProc = DefWindowProcW;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    windowClass.lpszClassName = L"ClickShade.RuntimeSmoke.Game";
+    RegisterClassW(&windowClass);
+    POINT pointer{};
+    GetCursorPos(&pointer);
+    MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoW(MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST), &monitor);
+    HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"ClickShade test game", WS_POPUP | WS_VISIBLE,
+        monitor.rcMonitor.left, monitor.rcMonitor.top, monitor.rcMonitor.right - monitor.rcMonitor.left,
+        monitor.rcMonitor.bottom - monitor.rcMonitor.top, nullptr, nullptr, windowClass.hInstance, nullptr);
+    if (!window) { CloseHandle(stop); return 3; }
+    SetForegroundWindow(window);
+    const ULONGLONG end = GetTickCount64() + 60000;
+    while (GetTickCount64() < end) {
+        if (MsgWaitForMultipleObjects(1, &stop, FALSE, 500, QS_ALLINPUT) == WAIT_OBJECT_0) break;
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    if (owner && IsWindow(owner)) SetForegroundWindow(owner);
+    AllowSetForegroundWindow(ASFW_ANY);
+    DestroyWindow(window);
+    CloseHandle(stop);
+    return 0;
+}
+
+// A copy of this program in a Steam library folder that owns a fullscreen
+// window: the runtime recognizes it as a game by its path. Nothing is
+// written outside the unique %TEMP% folder, which is removed afterwards.
+constexpr wchar_t kGameProbeName[] = L"ClickShadeGameProbe.exe";
+struct GameProbe {
+    std::vector<std::wstring> folders;
+    std::wstring exe;
+    HANDLE stop = nullptr;
+    PROCESS_INFORMATION process{};
+
+    bool Start(HWND owner) {
+        wchar_t temp[MAX_PATH + 1]{};
+        if (!GetTempPathW(MAX_PATH + 1, temp)) return false;
+        std::wstring folder = std::wstring(temp) + L"ClickShade-runtime-test-" + std::to_wstring(GetCurrentProcessId());
+        for (const wchar_t* part : {L"", L"\\steamapps", L"\\common", L"\\ClickShadeProbe"}) {
+            folder += part;
+            if (!CreateDirectoryW(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+            folders.push_back(folder);
+        }
+        exe = folder + L"\\" + kGameProbeName;
+        wchar_t own[32768]{};
+        if (!GetModuleFileNameW(nullptr, own, 32768) || !CopyFileW(own, exe.c_str(), FALSE)) return false;
+        const std::wstring eventName = L"Local\\ClickShadeGameProbe-" + std::to_wstring(GetCurrentProcessId());
+        stop = CreateEventW(nullptr, TRUE, FALSE, eventName.c_str());
+        if (!stop) return false;
+        wchar_t ownerText[32]{};
+        std::swprintf(ownerText, 32, L"%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(owner)));
+        std::wstring command = L"\"" + exe + L"\" --game-window " + eventName + L" " + ownerText;
+        STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+        if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process))
+            return false;
+        AllowSetForegroundWindow(process.dwProcessId);
+        for (int attempt = 0; attempt < 60; ++attempt) {
+            Pump(50);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(GetForegroundWindow(), &owner);
+            if (owner == process.dwProcessId) { Pump(300); return true; }
+        }
+        return false;
+    }
+
+    void Stop() {
+        if (stop) SetEvent(stop);
+        if (process.hProcess) {
+            if (WaitForSingleObject(process.hProcess, 5000) != WAIT_OBJECT_0) {
+                TerminateProcess(process.hProcess, 1);
+                WaitForSingleObject(process.hProcess, 2000);
+            }
+            CloseHandle(process.hProcess);
+            CloseHandle(process.hThread);
+            process = {};
+        }
+        if (stop) { CloseHandle(stop); stop = nullptr; }
+        if (!exe.empty()) { DeleteFileW(exe.c_str()); exe.clear(); }
+        for (auto folder = folders.rbegin(); folder != folders.rend(); ++folder) RemoveDirectoryW(folder->c_str());
+        folders.clear();
+    }
+
+    ~GameProbe() { Stop(); }
+};
+
 void TestInputAccessPolicy() {
     using clickshade::InputTokenFacts;
     using clickshade::CanReconcileAsyncButtons;
@@ -220,6 +343,7 @@ void TestInputAccessPolicy() {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 4 && wcscmp(argv[1], L"--game-window") == 0) return GameWindow(argv[2], argv[3]);
     if (argc != 2 || wcscmp(argv[1], L"--run") != 0) {
         std::puts("Run runtime_smoke.exe --run on an interactive test desktop.\n"
                   "The test moves, clips and hides the mouse temporarily, and uses a fullscreen window.");
@@ -531,32 +655,51 @@ int wmain(int argc, wchar_t** argv) {
     SetForegroundWindow(window);
     Pump();
     Mouse(MOUSEEVENTF_LEFTDOWN);
-    Describe(runtime, "fullscreen");
-    Check(runtime.Snapshot().fullscreen && runtime.Snapshot().pausedByRule &&
-          !runtime.Snapshot().pressed && Overlays().visible == 0,
-          "fullscreen pauses effects even if an automatic resize event was omitted");
-    Mouse(MOUSEEVENTF_LEFTUP);
-    options.allowedProcesses = L"  \"C:\\desktop\\" + OwnName() + L"\" ; unknown.exe ";
-    runtime.UpdateSettings(options); Pump();
-    Mouse(MOUSEEVENTF_LEFTDOWN);
-    Check(runtime.Snapshot().fullscreen && !runtime.Snapshot().pausedByRule &&
+    Describe(runtime, "fullscreen app");
+    Check(runtime.Snapshot().fullscreen && !runtime.Snapshot().fullscreenGame && !runtime.Snapshot().pausedByRule &&
           runtime.Snapshot().pressed && Overlays().visible > 0,
-          "a matching desktop-app allowance bypasses fullscreen without changing the global rule");
-    Mouse(MOUSEEVENTF_LEFTUP);
-    options.excludedProcesses = OwnName();
-    runtime.UpdateSettings(options); Pump();
-    Check(runtime.Snapshot().pausedByRule && Overlays().visible == 0,
-          "an explicit exclusion wins when the same app is also allowed");
-    options.excludedProcesses.clear();
-    options.allowedProcesses.clear();
-    options.pauseFullscreen = false;
-    runtime.UpdateSettings(options); Pump();
-    Mouse(MOUSEEVENTF_LEFTDOWN);
-    Check(runtime.Snapshot().pressed && Overlays().visible > 0,
-          "fullscreen behavior follows the explicit user override");
+          "a fullscreen app that is not a game (browser, video, slides) keeps every effect");
     Mouse(MOUSEEVENTF_LEFTUP);
     SetWindowLongPtrW(window, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
     SetWindowPos(window, HWND_TOP, 20, 20, 500, 350, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    Pump();
+    {
+        GameProbe game;
+        if (!game.Start(window)) {
+            Check(false, "a fullscreen test game starts from a Steam library folder");
+        } else {
+            Mouse(MOUSEEVENTF_LEFTDOWN);
+            Describe(runtime, "fullscreen game");
+            Check(runtime.Snapshot().fullscreen && runtime.Snapshot().fullscreenGame && runtime.Snapshot().pausedByRule &&
+                  !runtime.Snapshot().pressed && Overlays().visible == 0,
+                  "a fullscreen game pauses effects even if an automatic resize event was omitted");
+            Mouse(MOUSEEVENTF_LEFTUP);
+            options.allowedProcesses = std::wstring(L"  \"C:\\games\\") + kGameProbeName + L"\" ; unknown.exe ";
+            runtime.UpdateSettings(options); Pump();
+            Mouse(MOUSEEVENTF_LEFTDOWN);
+            Check(runtime.Snapshot().fullscreen && !runtime.Snapshot().pausedByRule &&
+                  runtime.Snapshot().pressed && Overlays().visible > 0,
+                  "a matching allowance bypasses the fullscreen-game pause without changing the global rule");
+            Mouse(MOUSEEVENTF_LEFTUP);
+            options.excludedProcesses = kGameProbeName;
+            runtime.UpdateSettings(options); Pump();
+            Check(runtime.Snapshot().pausedByRule && Overlays().visible == 0,
+                  "an explicit exclusion wins when the same app is also allowed");
+            options.excludedProcesses.clear();
+            options.allowedProcesses.clear();
+            options.pauseFullscreen = false;
+            runtime.UpdateSettings(options); Pump();
+            Mouse(MOUSEEVENTF_LEFTDOWN);
+            Check(runtime.Snapshot().pressed && Overlays().visible > 0,
+                  "fullscreen-game behavior follows the explicit user override");
+            Mouse(MOUSEEVENTF_LEFTUP);
+        }
+    }
+    SetForegroundWindow(window);
+    Pump();
+    Check(GetForegroundWindow() == window, "the test window is in front again after the test game closes");
+    options.excludedProcesses.clear();
+    options.allowedProcesses.clear();
     options.pauseFullscreen = true;
     runtime.UpdateSettings(options); Pump(450);
     ShowWindow(window, SW_MAXIMIZE); Pump();
@@ -570,6 +713,7 @@ int wmain(int argc, wchar_t** argv) {
     Check(ClipCursor(&clip) != FALSE, "test desktop accepts pointer confinement");
     Pump(230);
     Mouse(MOUSEEVENTF_MOVE, 2, 1, 100);
+    Describe(runtime, "confined");
     Check(runtime.Snapshot().cursorConfined && runtime.Snapshot().pausedByRule && Overlays().visible == 0,
           "throttled movement check discovers confinement and hides effects");
     Mouse(MOUSEEVENTF_LEFTDOWN);
@@ -611,6 +755,51 @@ int wmain(int argc, wchar_t** argv) {
     Mouse(MOUSEEVENTF_MOVE, 1, 1, 100);
     Check(!runtime.Snapshot().pausedByRule && Overlays().visible > 0,
           "input fallback resumes effects after a missed cursor-show event");
+
+    // Firefox hides the pointer (CSS cursor:none, such as an idle video
+    // player) with a fully transparent cursor instead of hiding it.
+    std::array<BYTE, 32 * 32 / 8> transparentMask{}, emptyImage{};
+    transparentMask.fill(0xFF);
+    HCURSOR blank = CreateCursor(GetModuleHandleW(nullptr), 0, 0, 32, 32, transparentMask.data(), emptyImage.data());
+    Check(blank != nullptr, "Windows creates a fully transparent test cursor");
+    if (blank) {
+        forcedCursor = blank;
+        SetCursor(blank);
+        NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, nullptr, OBJID_CURSOR, CHILDID_SELF);
+        Pump();
+        Mouse(MOUSEEVENTF_LEFTDOWN);
+        Check(runtime.Snapshot().pausedByRule && !runtime.Snapshot().pressed && Overlays().visible == 0,
+              "a fully transparent cursor counts as a hidden pointer and pauses every pointer effect");
+        Mouse(MOUSEEVENTF_LEFTUP);
+        forcedCursor = nullptr;
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, nullptr, OBJID_CURSOR, CHILDID_SELF);
+        Pump(230);
+        Mouse(MOUSEEVENTF_MOVE, 1, 1, 100);
+        Check(!runtime.Snapshot().pausedByRule && Overlays().visible > 0,
+              "effects return when the visible cursor comes back");
+        DestroyCursor(blank);
+    }
+
+    // While an app only hides the pointer, the configured cursor stays
+    // installed: no restore and rebuild when it hides and shows again.
+    options.cursorScale = 150;
+    runtime.UpdateSettings(options); Pump(800);
+    const auto installedUpdates = runtime.Snapshot().updateCount;
+    hiddenCalls = 0;
+    do { ++hiddenCalls; } while (ShowCursor(FALSE) >= 0 && hiddenCalls < 30);
+    NotifyWinEvent(EVENT_OBJECT_HIDE, nullptr, OBJID_CURSOR, CHILDID_SELF);
+    Pump();
+    const bool pausedWhileHidden = runtime.Snapshot().pausedByRule;
+    while (hiddenCalls-- > 0) ShowCursor(TRUE);
+    NotifyWinEvent(EVENT_OBJECT_SHOW, nullptr, OBJID_CURSOR, CHILDID_SELF);
+    Pump(230);
+    Mouse(MOUSEEVENTF_MOVE, 1, 1, 100);
+    Check(pausedWhileHidden && !runtime.Snapshot().pausedByRule &&
+          runtime.Snapshot().updateCount == installedUpdates,
+          "a hidden pointer keeps the enlarged cursor installed instead of restoring and rebuilding it");
+    options.cursorScale = 100;
+    runtime.UpdateSettings(options); Pump(800);
     options.allowedProcesses.clear();
 
     options.leftSoundPath = L"C:\\ClickShade_runtime_test_missing.wav";
@@ -632,6 +821,29 @@ int wmain(int argc, wchar_t** argv) {
         runtime.RefreshCursors(); Pump(800);
         Check(runtime.Snapshot().ready && runtime.Snapshot().previewRevision > revision,
               "system-scheme reload refreshes previews and keeps the runtime ready");
+        // Frequent broadcasts that cannot change cursor images (taskbar
+        // resize, accent colors) no longer reload the cursors, and a reload
+        // during a held press keeps the press and the held button.
+        HWND input = RuntimeInputWindow();
+        Check(input != nullptr, "the runtime's input window is found");
+        Mouse(MOUSEEVENTF_LEFTDOWN);
+        const auto held = runtime.Snapshot();
+        if (input) {
+            DWORD_PTR ignored = 0;
+            SendMessageTimeoutW(input, WM_SETTINGCHANGE, SPI_SETWORKAREA, 0, SMTO_BLOCK, 2000, &ignored);
+            SendMessageTimeoutW(input, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"),
+                                SMTO_BLOCK, 2000, &ignored);
+            Pump(400);
+            Check(held.pressed && runtime.Snapshot().pressed && runtime.Snapshot().previewRevision == held.previewRevision,
+                  "work-area and color broadcasts do not reload the cursors or drop the press");
+        }
+        runtime.RefreshCursors(); Pump(800);
+        Check(runtime.Snapshot().ready && runtime.Snapshot().pressed && runtime.Snapshot().heldButtons == held.heldButtons &&
+              runtime.Snapshot().previewRevision > held.previewRevision,
+              "a cursor reload during a held press keeps the pressed cursor and the held button");
+        Mouse(MOUSEEVENTF_LEFTUP);
+        Check(!runtime.Snapshot().pressed && runtime.Snapshot().heldButtons == 0,
+              "the release after a reload ends the press");
     }
     Mouse(MOUSEEVENTF_LEFTDOWN);
     runtime.Stop();

@@ -4,8 +4,6 @@
 
 namespace clickshade::ui {
 namespace {
-constexpr int kSpectrumGlow = 5; // Rows of glow above and below the 2 px line.
-
 void TextOut(HDC dc, const std::wstring& value, RECT rect, HFONT font, COLORREF color, UINT flags) {
     HFONT old = static_cast<HFONT>(SelectObject(dc, font));
     SetTextColor(dc, color); SetBkMode(dc, TRANSPARENT);
@@ -66,38 +64,77 @@ bool App::StatusIsWarning() const {
            (status.foregroundElevated && !elevated && settings.enabled);
 }
 
+void App::FreeSpectrumStrip() {
+    if (spectrumDc && spectrumOriginal) SelectObject(spectrumDc, spectrumOriginal);
+    if (spectrumBitmap) DeleteObject(spectrumBitmap);
+    if (spectrumDc) DeleteDC(spectrumDc);
+    spectrumDc = nullptr; spectrumBitmap = spectrumOriginal = nullptr;
+    spectrumPixels = nullptr; spectrumWidth = 0;
+}
+
 void App::DrawSpectrum(HDC dc, const RECT& line) {
     const int width = line.right - line.left;
-    const int rows = 2 * kSpectrumGlow + 2;
+    constexpr int rows = 2 * kSpectrumGlow + 2;
     if (width <= 0) return;
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -rows;
-    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bitmap || !bits) { if (bitmap) DeleteObject(bitmap); return; }
-    auto* pixels = static_cast<std::uint32_t*>(bits);
+    // The animation redraws this strip 30 times a second, so its DIB and
+    // memory DC stay until the window width changes.
+    if (!spectrumDc || spectrumWidth != width) {
+        FreeSpectrumStrip();
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -rows;
+        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        spectrumBitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (spectrumBitmap && bits) spectrumDc = CreateCompatibleDC(dc);
+        if (!spectrumDc) { FreeSpectrumStrip(); return; }
+        spectrumOriginal = static_cast<HBITMAP>(SelectObject(spectrumDc, spectrumBitmap));
+        spectrumPixels = static_cast<std::uint32_t*>(bits);
+        spectrumWidth = width;
+    }
+    GdiFlush(); // GDI must be done with the DIB before its pixels are written.
     const auto pack = [](COLORREF c) { return (static_cast<std::uint32_t>(GetRValue(c)) << 16) | (GetGValue(c) << 8) | GetBValue(c); };
+    // Glow strength by distance from the line; rows at the same distance above
+    // and below share one color.
+    std::array<double, kSpectrumGlow + 1> glow{};
+    for (int distance = 1; distance <= kSpectrumGlow; ++distance)
+        glow[static_cast<std::size_t>(distance)] = std::pow(0.55, distance) * (colors.dark ? 0.55 : 0.4);
     const bool animated = settings.uiAnimatedAccent;
     const double baseHue = animated ? spectrumPhase : 0.0;
+    std::array<std::uint32_t, kSpectrumGlow + 1> shades{};
     for (int x = 0; x < width; ++x) {
         COLORREF color;
         if (animated) color = FromHsv(baseHue + 360.0 * x / std::max(1, width), colors.dark ? 0.78 : 0.9, colors.dark ? 1.0 : 0.82);
         else color = Mix(colors.accent, colors.background, static_cast<double>(x) / std::max(1, width) * 0.85);
+        shades[0] = pack(color);
+        for (int distance = 1; distance <= kSpectrumGlow; ++distance)
+            shades[static_cast<std::size_t>(distance)] = pack(Mix(colors.background, color, glow[static_cast<std::size_t>(distance)]));
         for (int row = 0; row < rows; ++row) {
             const int distance = row < kSpectrumGlow ? kSpectrumGlow - row : row >= kSpectrumGlow + 2 ? row - kSpectrumGlow - 1 : 0;
-            double amount = 1.0;
-            if (distance) amount = std::pow(0.55, distance) * (colors.dark ? 0.55 : 0.4);
-            pixels[row * width + x] = pack(distance ? Mix(colors.background, color, amount) : color);
+            spectrumPixels[row * width + x] = shades[static_cast<std::size_t>(distance)];
         }
     }
-    HDC memory = CreateCompatibleDC(dc);
-    HGDIOBJ old = SelectObject(memory, bitmap);
-    BitBlt(dc, line.left, line.top - kSpectrumGlow, width, rows, memory, 0, 0, SRCCOPY);
-    SelectObject(memory, old);
-    DeleteDC(memory);
-    DeleteObject(bitmap);
+    BitBlt(dc, line.left, line.top - kSpectrumGlow, width, rows, spectrumDc, 0, 0, SRCCOPY);
+}
+
+RECT App::SpectrumBand() const {
+    RECT client{}; GetClientRect(window, &client);
+    const LONG footerTop = client.bottom - S(kFooterHeight);
+    return {0, footerTop - kSpectrumGlow - 1, client.right, footerTop + kSpectrumGlow + 2};
+}
+
+bool App::PaintSpectrumBand(HDC dc, const RECT& dirty) {
+    const RECT band = SpectrumBand();
+    if (dirty.left < band.left || dirty.top < band.top || dirty.right > band.right || dirty.bottom > band.bottom) return false;
+    // Paint draws nothing else into this band: the line covers every row but
+    // the top one, which belongs to the sidebar or the window background.
+    const LONG footerTop = band.top + kSpectrumGlow + 1;
+    RECT edge{0, band.top, std::min<LONG>(S(sidebarWidth), band.right), footerTop - kSpectrumGlow};
+    FillRect(dc, &edge, sidebarBrush);
+    edge.left = edge.right; edge.right = band.right;
+    FillRect(dc, &edge, background);
+    DrawSpectrum(dc, {0, footerTop, band.right, footerTop + 2});
+    return true;
 }
 
 void App::StartSpectrum() {
@@ -119,9 +156,11 @@ void App::TickSpectrum() {
     const ULONGLONG now = GetTickCount64();
     spectrumPhase = std::fmod(spectrumPhase + (now - spectrumLast) * 0.024, 360.0); // One full cycle every 15 s.
     spectrumLast = now;
-    RECT client{}; GetClientRect(window, &client);
-    const RECT line{0, client.bottom - S(kFooterHeight) - kSpectrumGlow - 1, client.right, client.bottom - S(kFooterHeight) + kSpectrumGlow + 2};
-    InvalidateRect(window, &line, FALSE);
+    // Another virtual desktop hides the window without minimizing it.
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(window, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof(cloaked))) && cloaked) return;
+    const RECT band = SpectrumBand();
+    InvalidateRect(window, &band, FALSE);
 }
 
 void App::DrawNavGlyph(HDC dc, int pageIndex, int x, int y, int size, COLORREF ink) {

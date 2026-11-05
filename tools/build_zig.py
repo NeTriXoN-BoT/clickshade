@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -30,6 +31,39 @@ LIBRARIES = (
     "user32", "gdi32", "comctl32", "shell32", "dwmapi", "advapi32",
     "wtsapi32", "uxtheme", "ole32", "oleaut32", "secur32", "winmm", "mfuuid", "comdlg32",
 )
+LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x800
+
+
+def dependent_load_flags(executable: Path) -> int | None:
+    """Return the DependentLoadFlags of a PE32+ image, or None without a load config.
+
+    Zig's linker has no option for this field, so src/app.cpp defines the load
+    configuration itself; this check keeps a toolchain change from dropping it.
+    """
+    data = executable.read_bytes()
+    header = struct.unpack_from("<I", data, 0x3C)[0]
+    if data[header:header + 4] != b"PE\0\0":
+        raise RuntimeError(f"{executable.name} is not a PE image")
+    sections, = struct.unpack_from("<H", data, header + 6)
+    optional_size, = struct.unpack_from("<H", data, header + 20)
+    optional = header + 24
+    if struct.unpack_from("<H", data, optional)[0] != 0x20B:
+        raise RuntimeError(f"{executable.name} is not a 64-bit image")
+    directories, = struct.unpack_from("<I", data, optional + 108)
+    if directories <= 10:
+        return None
+    rva, size = struct.unpack_from("<II", data, optional + 112 + 10 * 8)
+    if not rva or not size:
+        return None
+    for index in range(sections):
+        virtual_size, address, raw_size, raw_offset = struct.unpack_from(
+            "<IIII", data, optional + optional_size + index * 40 + 8)
+        if address <= rva < address + max(virtual_size, raw_size):
+            offset = raw_offset + rva - address
+            length, = struct.unpack_from("<I", data, offset)
+            # DependentLoadFlags is the WORD at offset 0x4E of the 64-bit layout.
+            return struct.unpack_from("<H", data, offset + 0x4E)[0] if length >= 0x50 else 0
+    return None
 
 
 def find_zig(override: str | None) -> Path:
@@ -118,6 +152,12 @@ def main() -> int:
             cwd=ROOT,
             env=env,
         )
+        # Static imports must load from System32 only, never from a DLL planted
+        # beside ClickShade.exe in a writable download folder.
+        flags = dependent_load_flags(executable)
+        if flags is None or not flags & LOAD_LIBRARY_SEARCH_SYSTEM32:
+            raise RuntimeError(f"{executable.name} was linked without System32-only DLL loading "
+                               "(the load configuration in src/app.cpp is missing)")
         shutil.copytree(ROOT / "sounds", output / "sounds", dirs_exist_ok=True)
         print(f"Built {executable} ({executable.stat().st_size:,} bytes)", flush=True)
 
@@ -130,6 +170,10 @@ def main() -> int:
             run(common + ["-Wl,--subsystem,console", str(ROOT / "tests" / "frame_pacing_test.cpp"),
                           "-o", str(pacing_test)], cwd=ROOT, env=env)
             print(f"Built {pacing_test} (headless adaptive frame-budget checks).", flush=True)
+            lead_test = output / "pointer_lead_test.exe"
+            run(common + ["-municode", "-Wl,--subsystem,console", str(ROOT / "tests" / "pointer_lead_test.cpp"),
+                          "-o", str(lead_test)], cwd=ROOT, env=env)
+            print(f"Built {lead_test} (headless pointer-lead checks with simulated mice and displays).", flush=True)
             geometry_test = output / "ui_scale_test.exe"
             run(common + ["-Wl,--subsystem,console", str(ROOT / "tests" / "ui_scale_test.cpp"),
                           "-o", str(geometry_test)], cwd=ROOT, env=env)

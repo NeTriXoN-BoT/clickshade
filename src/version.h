@@ -1,10 +1,11 @@
 #pragma once
 
 // Single source for the product version string used by the GUI, crash
-// reports and the --version output. The resource script, manifest, CMake and
-// the release packager carry the same number; change them together.
-#define CLICKSHADE_VERSION "1.0"
-#define CLICKSHADE_VERSION_W L"1.0"
+// reports and the --version output. The Linux build (linux/app.cpp) reads it
+// directly. The resource script, manifest, CMake and the release packager
+// carry the same number; change them together.
+#define CLICKSHADE_VERSION "1.1"
+#define CLICKSHADE_VERSION_W L"1.1"
 
 namespace clickshade {
 inline constexpr char kClickShadeVersion[] = CLICKSHADE_VERSION;

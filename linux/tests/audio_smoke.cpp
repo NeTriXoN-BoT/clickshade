@@ -217,6 +217,13 @@ int main() {
           "live gain stays consistent across the cached-prefix to streamed-sample boundary");
     Check(MixFrames(voices, mixed.data(), 480, 0, report) == 0 && !voices[0].clip,
           "muting stops and releases active voices instead of queuing silent long clips");
+    std::array<AudioVoice, kVoices> groups;
+    groups[0].clip = tone; groups[1].clip = tone; groups[1].keyboard = true;
+    ReleaseVoices(groups, kMouseGroup);
+    Check(!groups[0].clip && groups[1].clip && groups[1].keyboard,
+          "a hidden pointer releases click voices while typing voices keep playing");
+    ReleaseVoices(groups, kAllGroups);
+    Check(!groups[1].clip, "a full pause releases every voice");
     const std::string volumePath = directory + "/worker-volume.wav";
     Write(volumePath, bytes);
     Check(Finishes([&] {

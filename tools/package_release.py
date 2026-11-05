@@ -15,7 +15,7 @@ import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '1.0'
+VERSION = '1.1'
 SOURCE_DIRS = ('src', 'resources', 'tests', 'tools', 'sounds', 'THIRD_PARTY_NOTICES',
                'linux', 'assets', 'docs', '.github')
 SOURCE_ROOT_FILES = ('CMakeLists.txt', 'README.md', 'LICENSE', 'CHANGELOG.md',

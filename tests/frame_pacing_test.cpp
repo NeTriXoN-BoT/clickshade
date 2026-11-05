@@ -36,6 +36,26 @@ int main() {
     Check(pacer.Rate() == reduced, "an idle gap cannot count as recovery time");
     Run(pacer, 0.0001, 0.50);
     Check(pacer.Rate() == reduced, "recovery requires sustained headroom");
+    Run(pacer, 0.050, 0.15);
+    Check(pacer.Rate() == reduced, "a brief load spike is not yet a reason to lower Auto");
+    pacer.Observe(0.0001, 2.0);
+    Run(pacer, 0.0001, 0.90);
+    Check(pacer.Rate() == reduced, "frames without headroom discard the recovery progress before them");
+    unsigned clicks = 0;
+    while (pacer.Rate() < 240 && clicks < 400) {
+        // A default click effect: about 0.36 s of animation after an idle gap.
+        pacer.Observe(0.0001, 2.0);
+        Run(pacer, 0.0001, 0.36);
+        ++clicks;
+    }
+    std::printf("INFO %u short animations recovered Auto from %u Hz\n", clicks, reduced);
+    Check(pacer.Rate() == 240 && clicks > 10,
+          "short animations separated by idle gaps still recover Auto, step by step");
+    Run(pacer, 0.009, 3.0);
+    Check(pacer.Rate() >= 30 && pacer.Rate() <= 73, "returning load lowers Auto again");
+    pacer.Observe(0.0001, 60.0);
+    Run(pacer, 0.0001, 0.50);
+    Check(pacer.Rate() <= 73, "a long idle gap alone does not restore the monitor cap");
     Run(pacer, 0.0001, 25.0);
     Check(pacer.Rate() == 240, "Auto recovers upward without an idle timer or hardware inventory");
     Run(pacer, 0.100, 8.0);

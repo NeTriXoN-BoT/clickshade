@@ -5,6 +5,12 @@
 
 namespace clickshade::ui {
 namespace {
+// Administrator mode and Start with Windows are on, but the executable sits
+// where programs without administrator rights could replace it.
+constexpr wchar_t kUnprotectedStartupNote[] =
+    L"Start with Windows uses the normal startup entry, so Windows asks for approval at sign-in. ClickShade only "
+    L"starts elevated without a prompt from a folder that programs without administrator rights cannot change, such as Program Files.";
+
 struct ComRelease { void operator()(IUnknown* value) const noexcept { if (value) value->Release(); } };
 struct ComApartment {
     HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -362,9 +368,11 @@ bool App::StartEngine() {
     return started;
 }
 
+// Version 4 icons hide the standard tooltip unless every add and change
+// carries NIF_SHOWTIP.
 void App::AddTray() {
     NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1;
-    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     data.uCallbackMessage = kTrayMessage; data.hIcon = smallIcon ? smallIcon : icon;
     lstrcpynW(data.szTip, L"ClickShade - click to open settings", 128);
     trayLabel.clear();
@@ -375,7 +383,7 @@ void App::AddTray() {
 
 void App::UpdateTray() {
     if (!window) return;
-    NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1; data.uFlags = NIF_TIP;
+    NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1; data.uFlags = NIF_TIP | NIF_SHOWTIP;
     const std::wstring label = settings.enabled ? L"ClickShade - enabled" : L"ClickShade - paused";
     if (trayLabel == label) return;
     trayLabel = label;
@@ -494,16 +502,30 @@ void App::ImportSettingsProfile() {
     if (!LoadSettingsProfile(path, candidate, error)) {
         MessageBoxW(window, error.c_str(), L"Profile was not imported", MB_ICONWARNING); return;
     }
-    const int answer = MessageBoxW(window,
-        L"Apply all preferences from this Windows profile?\n\n"
+    std::wstring question = L"Apply all preferences from this Windows profile?\n\n"
         L"Your current preferences will first replace the single before-import backup. "
-        L"Startup registration and administrator mode stay unchanged. Sound and cursor paths may need to be selected again on this PC.",
-        L"Import profile?", MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
-    if (answer != IDOK) return;
+        L"Startup registration and administrator mode stay unchanged. Sound and cursor paths may need to be selected again on this PC.";
+    // Nothing has opened these paths yet. A shared profile could point at a
+    // server that collects the Windows sign-in, so they stay out by default.
+    const auto remote = NetworkProfilePaths(candidate);
+    if (!remote.empty()) {
+        question += L"\n\nThis profile also uses files on other computers or devices:\n";
+        for (const auto& field : remote) {
+            const auto& value = candidate.*field.member;
+            question += L"\n" + std::wstring(field.label) + L": " + (value.size() > 120 ? value.substr(0, 117) + L"..." : value);
+        }
+        question += L"\n\nOpening them connects to those computers with your Windows sign-in. "
+                    L"Choose Yes to keep these paths, No to import without them, or Cancel to import nothing.";
+    }
+    const int answer = MessageBoxW(window, question.c_str(), L"Import profile?",
+        (remote.empty() ? MB_OKCANCEL : MB_YESNOCANCEL) | MB_ICONQUESTION | MB_DEFBUTTON2);
+    if (answer != IDOK && answer != IDYES && answer != IDNO) return;
+    if (answer == IDNO) for (const auto& field : remote) (candidate.*field.member).clear();
     if (!ApplyImportedSettings(std::move(candidate), error)) {
         MessageBoxW(window, (L"The profile was not applied.\n\n" + error).c_str(), L"ClickShade", MB_ICONWARNING); return;
     }
-    const auto message = L"Profile imported. Your previous preferences are recoverable with Import profile from:\n\n" + SettingsProfileBackupPath(true);
+    auto message = L"Profile imported. Your previous preferences are recoverable with Import profile from:\n\n" + SettingsProfileBackupPath(true);
+    if (answer == IDNO) message += L"\n\nThe network and device paths were left out; choose those files again if you need them.";
     MessageBoxW(window, message.c_str(), L"ClickShade", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -689,25 +711,38 @@ void App::OpenFolder(const std::wstring& path) {
 
 void App::ReconcileStartupRegistration() {
     // The elevated instance owns the scheduled task; migrate silently so the
-    // user's single "Start with Windows" choice keeps matching their mode.
+    // user's single "Start with Windows" choice keeps matching their mode. The
+    // task stays only for a protected executable (an older build registered it
+    // anywhere), and an older build's below-normal task is registered again.
     if (!elevated) return;
     std::wstring error;
-    if (settings.startWithWindows && settings.runAsAdministrator && !IsStartupElevated())
+    // A task that an older copy registered for an unprotected folder keeps
+    // starting that copy elevated at sign-in; it goes first.
+    bool removedForeign = false;
+    RemoveUnsafeStartupTask(removedForeign, error);
+    const bool wantTask = settings.runAsAdministrator && elevatedStartupAllowed;
+    if (error.empty() && settings.startWithWindows && wantTask && (!IsStartupElevated() || IsStartupTaskOutdated()))
         ConfigureStartup(true, true, error);
-    else if (settings.startWithWindows && !settings.runAsAdministrator && IsStartupElevated())
+    else if (error.empty() && settings.startWithWindows && !wantTask && IsStartupElevated())
         ConfigureStartup(true, false, error);
     if (!error.empty()) compatibilityNote = error;
+    else if (removedForeign)
+        compatibilityNote = L"An elevated startup entry for ClickShade in another folder that programs without administrator "
+                            L"rights can change was removed. Switch Start with Windows on here to start this copy.";
+    else if (settings.startWithWindows && settings.runAsAdministrator && !elevatedStartupAllowed)
+        compatibilityNote = kUnprotectedStartupNote;
     settings.startWithWindows = IsStartupEnabled();
 }
 
 void App::ToggleStartup(bool requested) {
     std::wstring error;
-    const bool elevatedTask = settings.runAsAdministrator && elevated;
+    const bool elevatedTask = settings.runAsAdministrator && elevated && elevatedStartupAllowed;
     if (ConfigureStartup(requested, elevatedTask, error)) {
         settings.startWithWindows = requested;
-        compatibilityNote = requested && settings.runAsAdministrator && !elevated
-            ? L"Startup was registered without administrator rights. Once ClickShade runs as administrator it will switch the entry to a silent elevated task."
-            : L"";
+        if (!requested || !settings.runAsAdministrator) compatibilityNote.clear();
+        else if (!elevatedStartupAllowed) compatibilityNote = kUnprotectedStartupNote;
+        else if (!elevated) compatibilityNote = L"Startup was registered without administrator rights. Once ClickShade runs as administrator it will switch the entry to a silent elevated task.";
+        else compatibilityNote.clear();
     } else {
         MessageBoxW(window, error.c_str(), L"ClickShade", MB_ICONWARNING);
         settings.startWithWindows = IsStartupEnabled();
@@ -721,15 +756,25 @@ void App::ToggleRunAsAdministrator(bool requested) {
     FlushSettings();
     compatibilityNote.clear();
     if (requested && !elevated) {
-        const int answer = MessageBoxW(window,
-            L"ClickShade will restart with administrator rights now. Windows shows one prompt per manual start; "
-            L"with Start with Windows it starts silently through a scheduled task.\n\nRestart as administrator?",
+        const int answer = MessageBoxW(window, elevatedStartupAllowed
+            ? L"ClickShade will restart with administrator rights now. Windows shows one prompt per manual start; "
+              L"with Start with Windows it starts silently through a scheduled task.\n\nRestart as administrator?"
+            : L"ClickShade will restart with administrator rights now. Windows shows one prompt per manual start and at sign-in, "
+              L"because ClickShade is not in a protected folder such as Program Files.\n\nRestart as administrator?",
             L"Run as administrator", MB_OKCANCEL | MB_ICONQUESTION);
         std::wstring error;
         if (answer == IDOK && RelaunchElevated(error)) { Exit(); return; }
         settings.runAsAdministrator = false;
         pendingSave = true; FlushSettings();
         if (!error.empty()) compatibilityNote = error;
+    } else if (requested && elevated) {
+        // Already elevated, for example through Explorer's Run as administrator:
+        // move an ordinary startup entry to the silent task right away.
+        std::wstring error;
+        if (settings.startWithWindows && elevatedStartupAllowed && !IsStartupElevated()) ConfigureStartup(true, true, error);
+        if (!error.empty()) compatibilityNote = error;
+        else if (settings.startWithWindows && !elevatedStartupAllowed) compatibilityNote = kUnprotectedStartupNote;
+        settings.startWithWindows = IsStartupEnabled();
     } else if (!requested && elevated) {
         std::wstring error;
         if (settings.startWithWindows && IsStartupElevated()) ConfigureStartup(true, false, error);

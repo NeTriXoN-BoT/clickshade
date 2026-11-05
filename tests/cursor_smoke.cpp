@@ -112,6 +112,140 @@ CursorSnapshot ReadCursor(HCURSOR cursor) {
     return result;
 }
 
+// Windows draws cursors at their nominal size times the pointer size
+// (CursorBaseSize/32) and the display scale. At any other factor than 1 it
+// reports a nominal image derived from the larger image it draws, so an
+// installed cursor equals its prepared artwork exactly only at factor 1.
+double DrawFactor() {
+    DWORD base = 32, bytes = sizeof(base);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Control Panel\\Cursors", L"CursorBaseSize", RRF_RT_REG_DWORD, nullptr, &base, &bytes) != ERROR_SUCCESS)
+        base = 32;
+    POINT point{}; GetCursorPos(&point);
+    const UINT dpi = GetDpiForWindow(GetDesktopWindow());
+    (void)point;
+    return std::max(32.0, static_cast<double>(base)) / 32.0 * (dpi ? dpi / 96.0 : 1.0);
+}
+
+double MeanDifference(const CursorSnapshot& a, const CursorSnapshot& b) {
+    if (a.color.bgra.size() != b.color.bgra.size() || a.color.bgra.empty()) return 1e9;
+    double sum = 0;
+    for (std::size_t i = 0; i < a.color.bgra.size(); i += 4) {
+        const int a1 = a.color.bgra[i + 3], a2 = b.color.bgra[i + 3];
+        for (int c = 0; c < 3; ++c) sum += std::abs(a.color.bgra[i + c] * a1 / 255 - b.color.bgra[i + c] * a2 / 255);
+        sum += std::abs(a1 - a2);
+    }
+    return sum / static_cast<double>(a.color.bgra.size() / 4);
+}
+
+// Mean difference after a 3x3 box blur of both images, in premultiplied
+// form: resampling noise at edges averages out, a different picture (an
+// inverted or missing state differs by 100 or more) does not.
+double BlurredDifference(const CursorSnapshot& a, const CursorSnapshot& b) {
+    if (a.color.bgra.size() != b.color.bgra.size() || a.color.bgra.empty() || a.color.width != b.color.width) return 1e9;
+    const LONG w = a.color.width, h = a.color.height;
+    const auto sample = [&](const CursorSnapshot& s, LONG x, LONG y, int c) {
+        double sum = 0; int n = 0;
+        for (LONG dy = -1; dy <= 1; ++dy) for (LONG dx = -1; dx <= 1; ++dx) {
+            const LONG sx = x + dx, sy = y + dy;
+            if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
+            const auto* p = s.color.bgra.data() + (static_cast<std::size_t>(sy) * w + sx) * 4;
+            sum += c == 3 ? p[3] : p[c] * p[3] / 255.0; ++n;
+        }
+        return sum / n;
+    };
+    double total = 0;
+    for (LONG y = 0; y < h; ++y) for (LONG x = 0; x < w; ++x)
+        for (int c = 0; c < 4; ++c) total += std::abs(sample(a, x, y, c) - sample(b, x, y, c));
+    return total / (static_cast<double>(w) * h);
+}
+
+// An installed cursor shows the prepared artwork: exactly at factor 1, and as
+// the same image (within resampling) where Windows derives the nominal image.
+bool SameInstalled(const CursorSnapshot& installed, const CursorSnapshot& expected) {
+    if (std::abs(DrawFactor() - 1.0) < 0.01 || installed.color.bgra.empty() || expected.color.bgra.empty())
+        return installed == expected;
+    return installed.xHotspot == expected.xHotspot && installed.yHotspot == expected.yHotspot &&
+           installed.color.width == expected.color.width && installed.color.height == expected.color.height &&
+           BlurredDifference(installed, expected) <= 4.0;
+}
+
+// Decodes a cursor file's first image at its own size, independently of the
+// pointer size (LoadImage applies the pointer size even for "native" loads).
+HCURSOR LoadNative(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return nullptr;
+    LARGE_INTEGER size{}; GetFileSizeEx(file, &size);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size.QuadPart)); DWORD read = 0;
+    const bool ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size();
+    CloseHandle(file);
+    if (!ok || bytes.size() < 22) return nullptr;
+    const auto u32 = [&](std::size_t at) { return bytes[at] | bytes[at + 1] << 8 | bytes[at + 2] << 16 | static_cast<std::uint32_t>(bytes[at + 3]) << 24; };
+    const std::uint32_t length = u32(14), offset = u32(18);
+    if (offset + static_cast<std::size_t>(length) > bytes.size()) return nullptr;
+    std::vector<std::uint32_t> resource((length + 4 + 3) / 4, 0);
+    resource[0] = static_cast<std::uint32_t>(bytes[10] | bytes[11] << 8) | static_cast<std::uint32_t>(bytes[12] | bytes[13] << 8) << 16;
+    std::copy_n(bytes.data() + offset, length, reinterpret_cast<std::uint8_t*>(resource.data()) + 4);
+    return reinterpret_cast<HCURSOR>(CreateIconFromResourceEx(reinterpret_cast<PBYTE>(resource.data()), length + 4, FALSE, 0x00030000, 0, 0, 0));
+}
+
+// The image Windows draws for a cursor at width x height: drawn over black
+// and white, colors and alpha recovered. Empty for background-inverting art.
+CursorSnapshot DrawnImage(HCURSOR cursor, int width, int height) {
+    CursorSnapshot result;
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    HDC screen = GetDC(nullptr); HDC dc = CreateCompatibleDC(screen); ReleaseDC(nullptr, screen);
+    std::vector<std::uint8_t> planes[2];
+    for (int pass = 0; pass < 2; ++pass) {
+        void* bits = nullptr; HBITMAP target = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        const HGDIOBJ previous = SelectObject(dc, target);
+        std::fill_n(static_cast<std::uint8_t*>(bits), static_cast<std::size_t>(width) * height * 4, static_cast<std::uint8_t>(pass ? 255 : 0));
+        DrawIconEx(dc, 0, 0, cursor, width, height, 0, nullptr, DI_NORMAL); GdiFlush();
+        planes[pass].assign(static_cast<std::uint8_t*>(bits), static_cast<std::uint8_t*>(bits) + static_cast<std::size_t>(width) * height * 4);
+        SelectObject(dc, previous); DeleteObject(target);
+    }
+    DeleteDC(dc);
+    result.color.width = width; result.color.height = height; result.color.bgra.assign(planes[0].size(), 0);
+    for (std::size_t i = 0; i < planes[0].size(); i += 4) {
+        int alpha = 0;
+        for (int c = 0; c < 3; ++c) {
+            if (planes[1][i + c] < planes[0][i + c]) return {};
+            alpha = std::max(alpha, 255 - (planes[1][i + c] - planes[0][i + c]));
+        }
+        result.color.bgra[i + 3] = static_cast<std::uint8_t>(alpha);
+        for (int c = 0; c < 3; ++c) result.color.bgra[i + c] = alpha ? static_cast<std::uint8_t>(std::min(255, (planes[0][i + c] * 255 + alpha / 2) / alpha)) : 0;
+    }
+    return result;
+}
+
+// The embedded 32-bit image of `size` from a .cur file, as straight BGRA.
+CursorSnapshot EmbeddedImage(const std::wstring& path, int size) {
+    CursorSnapshot result;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return result;
+    LARGE_INTEGER length{}; GetFileSizeEx(file, &length);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(length.QuadPart)); DWORD read = 0;
+    const bool ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size();
+    CloseHandle(file);
+    if (!ok || bytes.size() < 6 || bytes[2] != 2) return result;
+    const auto u32 = [&](std::size_t at) { return bytes[at] | bytes[at + 1] << 8 | bytes[at + 2] << 16 | static_cast<std::uint32_t>(bytes[at + 3]) << 24; };
+    for (unsigned k = 0; k < bytes[4] && 6 + 16 * k + 16 <= bytes.size(); ++k) {
+        const std::size_t e = 6 + 16 * k;
+        if ((bytes[e] ? bytes[e] : 256) != size || (bytes[e + 1] ? bytes[e + 1] : 256) != size) continue;
+        const std::size_t at = u32(e + 12);
+        if (at + 40 + static_cast<std::size_t>(size) * size * 4 > bytes.size() || u32(at) != 40 || bytes[at + 14] != 32) return result;
+        result.color.width = size; result.color.height = size; result.color.bgra.resize(static_cast<std::size_t>(size) * size * 4);
+        for (int y = 0; y < size; ++y)
+            std::copy_n(bytes.data() + at + 40 + static_cast<std::size_t>(size - 1 - y) * size * 4, static_cast<std::size_t>(size) * 4,
+                        result.color.bgra.data() + static_cast<std::size_t>(y) * size * 4);
+        for (std::size_t i = 3; i < result.color.bgra.size(); i += 4)
+            if (!result.color.bgra[i]) result.color.bgra[i - 3] = result.color.bgra[i - 2] = result.color.bgra[i - 1] = 0;
+        return result;
+    }
+    return result;
+}
+
 class TestWindow {
 public:
     TestWindow() {
@@ -410,13 +544,13 @@ void TestLegacyAndClassicScaling(clickshade::CursorEngine& engine) {
             CursorFixtures::LegacyImage(color, false));
         appearance.size = 0;
         Require(engine.Configure(appearance, error), "ordinary legacy cursor decodes at its native size");
-        OwnedCursor native(reinterpret_cast<HCURSOR>(LoadImageW(nullptr, appearance.releasedPath.c_str(), IMAGE_CURSOR, 0, 0, LR_LOADFROMFILE)));
+        OwnedCursor native(LoadNative(appearance.releasedPath));
         Check(native.value && Preview(engine, false) == ReadCursor(native.value),
               "source-size legacy artwork retains original pixels, mask and hotspot exactly");
         bool allSizes = true, allHotspots = true, allAlpha = true, allPairs = true;
         for (int size : {24, 25, 31, 33, 40, 63, 64, 96, 127, 128}) {
             appearance.size = size;
-            if (!engine.Configure(appearance, error)) { allSizes = false; break; }
+            if (!engine.Configure(appearance, error)) { std::printf("DBG legacy size %d: %ls\n", size, error.c_str()); allSizes = false; break; }
             const auto light = Preview(engine, false), dark = Preview(engine, true);
             allSizes &= light.color.width == size && light.color.height == size;
             allHotspots &= light.xHotspot == static_cast<DWORD>(MulDiv(1, size, 32)) &&
@@ -464,7 +598,7 @@ void TestLegacyAndClassicScaling(clickshade::CursorEngine& engine) {
     bool classicSizes = true, classicClean = true, diagonal = true;
     for (int size : {24, 25, 31, 32, 33, 40, 48, 64, 96, 127, 128}) {
         appearance.size = size;
-        if (!engine.Configure(appearance, error)) { classicSizes = false; break; }
+        if (!engine.Configure(appearance, error)) { std::printf("DBG classic size %d: %ls\n", size, error.c_str()); classicSizes = false; break; }
         const auto cursor = Preview(engine, false);
         classicSizes &= cursor.color.width == size && cursor.color.height == size &&
             cursor.xHotspot == 0 && cursor.yHotspot == 0;
@@ -590,8 +724,17 @@ void TestMagnification(clickshade::CursorEngine& engine, bool wine) {
         const auto beamBefore = ReadCursor(LoadCursorW(nullptr, IDC_IBEAM));
         SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
         Require(engine.ApplyCurrent(error), "native I-beam transition accepts the locator Arrow");
-        Check(ReadCursor(LoadCursorW(nullptr, IDC_IBEAM)) == large,
-              "native shape transition during unpressed magnification uses the cached Arrow");
+        const auto beam = ReadCursor(LoadCursorW(nullptr, IDC_IBEAM));
+        bool sameArrow = SameInstalled(beam, large);
+        if (std::abs(DrawFactor() - 1.0) >= 0.01 && !beam.color.bgra.empty()) {
+            // Windows reports an image derived from the larger drawn one; the
+            // magnified Arrow is recognisable by its size, tip and color.
+            const auto a = CenterPixel(beam), b = CenterPixel(large);
+            sameArrow = beam.color.width == large.color.width && beam.color.height == large.color.height &&
+                        beam.xHotspot == large.xHotspot && beam.yHotspot == large.yHotspot &&
+                        std::abs(a[0] - b[0]) <= 12 && std::abs(a[1] - b[1]) <= 12 && std::abs(a[2] - b[2]) <= 12 && std::abs(a[3] - b[3]) <= 12;
+        }
+        Check(sameArrow, "native shape transition during unpressed magnification uses the cached Arrow");
         Require(engine.SetMagnification(1.f, error), "native magnification finishes");
         Check(ReadCursor(LoadCursorW(nullptr, IDC_IBEAM)) == beamBefore,
               "ending magnification restores the configured normal role shape");
@@ -644,7 +787,7 @@ void TestHeldRoleTransitions(clickshade::CursorEngine& engine, bool wine) {
     Check(engine.ApplyCurrent(error) && engine.IsPressed(), "pressed appearance resumes when an application returns to a supported system role");
     if (!wine) {
         OwnedCursor expected(engine.CopyPreview(true));
-        Check(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)) == ReadCursor(expected.value),
+        Check(SameInstalled(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)), ReadCursor(expected.value)),
               "native arrow remains pressed after drag-style role transitions");
     }
     Require(engine.SetPressed(false, error) && engine.Restore(error), "held-role transitions restore on the actual release");
@@ -750,13 +893,13 @@ void TestProfiles(clickshade::CursorEngine& engine, const CursorSnapshot& origin
     Check(Preview(engine, false) == currentPressed && Preview(engine, true) == currentReleased,
           "reverse mode swaps cached released and pressed artwork exactly");
     Require(engine.SetActive(true, error), "reversed released profile activates");
-    if (!wine) Check(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)) == currentPressed,
+    if (!wine) Check(SameInstalled(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)), currentPressed),
                      "native reverse mode is inverted while released");
     Require(engine.SetPressed(true, error), "reversed profile accepts press");
-    if (!wine) Check(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)) == currentReleased,
+    if (!wine) Check(SameInstalled(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)), currentReleased),
                      "native reverse mode returns to original artwork while pressed");
     Require(engine.SetPressed(false, error), "reversed profile returns to configured release");
-    if (!wine) Check(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)) == currentPressed,
+    if (!wine) Check(SameInstalled(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)), currentPressed),
                      "native reverse release retains its configured baseline");
     Require(engine.SetActive(false, error), "pausing reverse mode restores user originals");
     if (!wine) Check(ReadCursor(LoadCursorW(nullptr, IDC_ARROW)) == original,
@@ -829,8 +972,8 @@ void TestProfiles(clickshade::CursorEngine& engine, const CursorSnapshot& origin
     CursorAppearance custom; custom.style = 3; custom.releasedPath = files.released;
     custom.pressedPath = files.pressed;
     Require(engine.Configure(custom, error), "custom static released/pressed pair loads");
-    OwnedCursor fileReleased(reinterpret_cast<HCURSOR>(LoadImageW(nullptr, files.released.c_str(), IMAGE_CURSOR, 0, 0, LR_LOADFROMFILE)));
-    OwnedCursor filePressed(reinterpret_cast<HCURSOR>(LoadImageW(nullptr, files.pressed.c_str(), IMAGE_CURSOR, 0, 0, LR_LOADFROMFILE)));
+    OwnedCursor fileReleased(LoadNative(files.released));
+    OwnedCursor filePressed(LoadNative(files.pressed));
     Check(Preview(engine, false) == ReadCursor(fileReleased.value) && Preview(engine, true) == ReadCursor(filePressed.value),
           "custom pair preserves each selected file's pixels, dimensions and hotspot");
     auto customOriginal = Preview(engine, false);
@@ -923,6 +1066,67 @@ FrameInfoFunction FrameInfo() {
 }
 
 bool Near(int value, int expected, int tolerance) { return std::abs(value - expected) <= tolerance; }
+
+// With a larger pointer size or display scale, every installed state must be
+// drawn from an image made at the drawn size, never from a stretched bitmap:
+// the theme arrow as its own embedded image, pressed as its exact inverse.
+void TestDrawnSizes(clickshade::CursorEngine& engine, bool wine) {
+    std::wstring error;
+    if (wine) { Skip("drawn-size cursor images: needs native Windows"); return; }
+    wchar_t registered[MAX_PATH]{}, expanded[MAX_PATH]{};
+    DWORD bytes = sizeof(registered);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Control Panel\\Cursors", L"Arrow", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+                     nullptr, registered, &bytes) != ERROR_SUCCESS || !ExpandEnvironmentStringsW(registered, expanded, MAX_PATH)) {
+        Skip("drawn-size cursor images: the theme arrow has no registered file"); return;
+    }
+    Require(engine.Restore(error) && engine.Configure({}, error), "drawn-size checks start from the current scheme");
+    const auto nominal = Preview(engine, false);
+    const int width = nominal.color.width ? static_cast<int>(nominal.color.width) : static_cast<int>(nominal.mask.width);
+    const int drawn = std::min(256, static_cast<int>(std::lround(width * DrawFactor())));
+    const auto theme = EmbeddedImage(expanded, drawn);
+    std::printf("INFO pointer draw factor %.2f: a %d px arrow is drawn at %d px\n", DrawFactor(), width, drawn);
+    if (theme.color.bgra.empty()) { Skip("drawn-size cursor images: the theme file has no image of the drawn size"); return; }
+    CursorSnapshot inverted = theme;
+    clickshade::InvertCursorBgra(inverted.color.bgra.data(), inverted.color.bgra.size() / 4);
+    const auto drawnNow = [&] { return DrawnImage(LoadCursorW(nullptr, IDC_ARROW), drawn, drawn); };
+
+    Require(engine.SetActive(true, error) && engine.SetPressed(true, error), "the default profile activates and presses");
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    Require(engine.ApplyCurrent(error), "the pressed arrow is installed");
+    Check(MeanDifference(drawnNow(), inverted) <= 1.5,
+          "the pressed arrow is drawn as the exact inverse of the theme's own image at the drawn size, not a stretched bitmap");
+    Require(engine.SetPressed(false, error), "the arrow is released");
+    Check(MeanDifference(drawnNow(), theme) <= 1.5, "after a press the theme arrow is drawn exactly as before");
+    Require(engine.Restore(error), "drawn-size press checks restore");
+    Check(MeanDifference(drawnNow(), theme) <= 1.5, "pausing restores the theme arrow exactly at the drawn size");
+
+    clickshade::CursorAppearance faded; faded.opacity = 50;
+    Require(engine.Configure(faded, error) && engine.SetActive(true, error), "a faded profile installs");
+    CursorSnapshot halfTheme = theme;
+    for (std::size_t i = 3; i < halfTheme.color.bgra.size(); i += 4)
+        halfTheme.color.bgra[i] = static_cast<std::uint8_t>((halfTheme.color.bgra[i] * 50 + 50) / 100);
+    Check(MeanDifference(drawnNow(), halfTheme) <= 2.0, "a faded arrow is drawn from the full-resolution theme image");
+    Require(engine.Restore(error), "the faded profile restores");
+
+    clickshade::CursorAppearance doubled; doubled.scale = 200;
+    Require(engine.Configure(doubled, error) && engine.SetActive(true, error), "a 200 percent profile installs");
+    const int doubledSize = std::min(256, static_cast<int>(std::lround(width * 2 * DrawFactor())));
+    const auto doubledTheme = EmbeddedImage(expanded, doubledSize);
+    if (!doubledTheme.color.bgra.empty())
+        Check(MeanDifference(DrawnImage(LoadCursorW(nullptr, IDC_ARROW), doubledSize, doubledSize), doubledTheme) <= 1.5,
+              "a 200 percent arrow is drawn from the theme's own image of that size");
+    else Skip("200 percent drawn-size check: the theme file has no image of that size");
+    Require(engine.Restore(error), "the scaled profile restores");
+
+    clickshade::CursorAppearance classic; classic.style = 2;
+    Require(engine.Configure(classic, error) && engine.SetActive(true, error), "the classic arrow installs");
+    const auto classicDrawn = drawnNow();
+    bool antialiased = false;
+    for (std::size_t i = 3; i < classicDrawn.color.bgra.size(); i += 4) antialiased |= classicDrawn.color.bgra[i] > 0 && classicDrawn.color.bgra[i] < 255;
+    if (std::abs(DrawFactor() - 1.0) >= 0.01)
+        Check(antialiased, "the classic arrow is drawn at the final resolution instead of stretching its 32 px bitmap");
+    Require(engine.Restore(error) && engine.Configure({}, error), "drawn-size checks return to the current scheme");
+}
 
 // Opacity, shadow and colors apply to every role, keep straight alpha (the
 // representation Windows draws) and leave animated roles animated.
@@ -1049,6 +1253,9 @@ void TestCursorLook(clickshade::CursorEngine& engine, bool wine) {
         return;
     }
     const auto originalFrame = ReadCursor(firstFrame);
+    const int animatedDrawn = std::min(256, static_cast<int>(std::lround(
+        (originalFrame.color.width ? originalFrame.color.width : originalFrame.mask.width) * DrawFactor())));
+    const auto originalDrawn = DrawnImage(firstFrame, animatedDrawn, animatedDrawn);
     Require(engine.Configure(faded, error) && engine.SetActive(true, error), "a faded profile activates over an animated Wait cursor");
     DWORD styledRate = 0, styledFrames = 0;
     const HCURSOR styledFirst = frameInfo(LoadCursorW(nullptr, IDC_WAIT), 0, 0, &styledRate, &styledFrames);
@@ -1064,6 +1271,17 @@ void TestCursorLook(clickshade::CursorEngine& engine, bool wine) {
             ++counted;
             frameHalved &= Near(styledFrame.color.bgra[i + 3], 128, 1);
             for (int c = 0; c < 3; ++c) frameColors &= Near(styledFrame.color.bgra[i + c], originalFrame.color.bgra[i + c], 3);
+        }
+        if (std::abs(DrawFactor() - 1.0) >= 0.01 && !originalDrawn.color.bgra.empty()) {
+            // Windows reports frames derived from the drawn size, so compare
+            // what it draws: the original frame with half its opacity.
+            CursorSnapshot expectedFrame = originalDrawn;
+            for (std::size_t i = 3; i < expectedFrame.color.bgra.size(); i += 4)
+                expectedFrame.color.bgra[i] = static_cast<std::uint8_t>((expectedFrame.color.bgra[i] * 50 + 50) / 100);
+            const double difference = MeanDifference(DrawnImage(styledFirst, animatedDrawn, animatedDrawn), expectedFrame);
+            std::printf("INFO animated frame drawn at %d px differs from the faded original by %.2f\n", animatedDrawn, difference);
+            frameHalved = counted > 0 && difference <= 2.5;
+            frameColors = frameHalved;
         }
         Check(counted > 0 && frameHalved, "every animated frame is faded to half opacity");
         Check(frameColors, "animated frames keep straight colors through the rebuilt cursor file");
@@ -1143,6 +1361,7 @@ int wmain(int argc, wchar_t** argv) {
             TestMagnification(engine, wine);
             TestHeldRoleTransitions(engine, wine);
             TestCursorLook(engine, wine);
+            TestDrawnSizes(engine, wine);
             Require(engine.Reload(error), "cursor cache can reload after restoration");
             TestPreviews(engine);
             Require(engine.SetPressed(true, error) && engine.ApplyCurrent(error),

@@ -23,11 +23,16 @@ public:
     bool Start(const Settings& settings, std::wstring& error);
     void Stop();
     void UpdateSettings(const Settings& settings);
+    // Gates mouse sounds (Click, Preview); false also cuts mouse voices.
     void SetAllowed(bool allowed) noexcept;
+    // Gates keyboard sounds (Key, PreviewKey) on their own, so a pointer that
+    // hides while typing does not silence or cut key sounds.
+    void SetKeyboardAllowed(bool allowed) noexcept;
     void Click(unsigned buttonMask) noexcept;
     // Category only (KeyCategory); no key identity reaches this object.
     void Key(unsigned category) noexcept;
-    // Preview ignores the enable checkboxes, but respects SetAllowed.
+    // Previews ignore the enable checkboxes, but respect their group's gate.
+    // A switched-off group's files are opened only when a preview asks.
     void Preview(unsigned buttonMask) noexcept;
     void PreviewKey() noexcept;
     // True once the worker runs and has prepared the current sources; requests

@@ -54,6 +54,10 @@ if(CLICKSHADE_BUILD_TESTS)
     target_link_libraries(ClickShadeHotkeysTest PRIVATE PkgConfig::CLICKSHADE_LINUX
         PkgConfig::CLICKSHADE_XTEST Threads::Threads)
     add_test(NAME LinuxHotkeyConfig COMMAND ClickShadeHotkeysTest --headless)
+    add_executable(ClickShadeGameDetectionTest tests/game_detection_test.cpp)
+    target_compile_features(ClickShadeGameDetectionTest PRIVATE cxx_std_17)
+    target_compile_options(ClickShadeGameDetectionTest PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME LinuxFullscreenGames COMMAND ClickShadeGameDetectionTest)
     add_executable(ClickShadeX11Test tests/x11_smoke.cpp x11_engine.cpp audio.cpp settings.cpp)
     target_include_directories(ClickShadeX11Test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" ${CLICKSHADE_PULSE_HEADERS_INCLUDE_DIRS})
     target_compile_features(ClickShadeX11Test PRIVATE cxx_std_17)
@@ -67,4 +71,6 @@ endif()
 install(TARGETS ClickShadeLinux RUNTIME DESTINATION bin)
 install(DIRECTORY ../sounds/ DESTINATION bin/sounds)
 install(FILES ../assets/clickshade.svg DESTINATION share/icons/hicolor/scalable/apps)
-install(FILES clickshade.desktop DESTINATION share/applications)
+# GTK sets the Wayland app_id to the application ID, and GNOME Shell finds the
+# launcher by that name. StartupWMClass keeps X11 WM_CLASS matching working.
+install(FILES clickshade.desktop DESTINATION share/applications RENAME io.clickshade.ClickShade.desktop)

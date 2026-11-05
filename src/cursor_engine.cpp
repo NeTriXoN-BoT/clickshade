@@ -1,5 +1,7 @@
 #include "cursor_engine.h"
 
+#include <sddl.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -7,6 +9,8 @@
 #include <cwctype>
 #include <iterator>
 #include <limits>
+#include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -42,7 +46,6 @@ void UnpremultiplyBgra(std::uint8_t* pixels, std::size_t count) noexcept {
 }
 
 constexpr DWORD kNormalCursor = 32512;
-constexpr UINT kImageCursor = 2;
 
 struct Role {
     DWORD id;
@@ -83,9 +86,17 @@ std::wstring WinError(const wchar_t* action, DWORD code) {
     return message;
 }
 
+// An exact, independent copy of a cursor's images and hotspot. CopyImage is
+// not exact: with a larger pointer size it resamples through the drawn size
+// and returns odd sizes one pixel short (25x25 becomes 25x24).
 HCURSOR CopyOwnedCursor(HCURSOR source) noexcept {
-    return reinterpret_cast<HCURSOR>(
-        CopyImage(source, kImageCursor, 0, 0, 0));
+    ICONINFO info{};
+    if (!source || !GetIconInfo(source, &info)) return nullptr;
+    info.fIcon = FALSE;
+    const HCURSOR copy = reinterpret_cast<HCURSOR>(CreateIconIndirect(&info));
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    if (info.hbmMask) DeleteObject(info.hbmMask);
+    return copy;
 }
 
 std::wstring RegisteredCursorPath(const wchar_t* registryName) {
@@ -132,6 +143,14 @@ struct CursorOwner {
     CursorOwner(const CursorOwner&) = delete;
     CursorOwner& operator=(const CursorOwner&) = delete;
     ~CursorOwner() { if (value) DestroyCursor(value); }
+};
+
+struct OwnedCursors {
+    std::vector<HCURSOR> items;
+    OwnedCursors() = default;
+    OwnedCursors(const OwnedCursors&) = delete;
+    OwnedCursors& operator=(const OwnedCursors&) = delete;
+    ~OwnedCursors() { for (const HCURSOR item : items) if (item) DestroyCursor(item); }
 };
 
 struct IconBitmaps {
@@ -617,6 +636,26 @@ HCURSOR CursorFromPremultiplied(const std::vector<std::uint8_t>& pixels, int wid
 // grows the canvas to the right and bottom (and by its blur on the other
 // sides, moving the hotspot with the artwork); it shrinks to stay within
 // Windows' 256-pixel cursor limit.
+// The shadow's growth, as LookPixels computes it, for artwork whose longest
+// side is `side`.
+int ShadowedSide(int side) noexcept {
+    int offset = std::max(1, static_cast<int>(std::lround(side / 16.0)));
+    int blur = offset;
+    while (side + offset + 2 * blur > 256 && (offset > 0 || blur > 0)) {
+        if (blur > 0) --blur; else --offset;
+    }
+    return side + offset + 2 * blur;
+}
+
+// The artwork size whose finished cursor (after the look) is `target`, or
+// the smallest one that exceeds it, which Windows then shrinks slightly.
+int ArtworkSideFor(int target, const CursorAppearance& look) noexcept {
+    if (!look.shadow) return target;
+    for (int side = std::max(1, target * 3 / 4); side < target; ++side)
+        if (ShadowedSide(side) >= target) return side;
+    return target;
+}
+
 void LookPixels(std::vector<std::uint8_t>& pixels, int& width, int& height, DWORD& hotX, DWORD& hotY,
                 const CursorAppearance& look) {
     if (look.tint) {
@@ -853,45 +892,14 @@ HCURSOR DecodeStaticFile(const std::vector<std::uint8_t>& bytes,
     return CopyAtSize(source.value, size, error);
 }
 
-// One frame as .cur file data: a single 32-bit image with its AND mask.
-// Cursor files store straight alpha, like every Windows cursor bitmap.
-bool EncodeCursorFile(HCURSOR cursor, std::vector<std::uint8_t>& out) {
-    std::vector<std::uint8_t> pixels;
-    int width = 0, height = 0; DWORD hotX = 0, hotY = 0;
-    std::wstring ignored;
-    if (!ReadPremultiplied(cursor, pixels, width, height, hotX, hotY, ignored) || width > 256 || height > 256) return false;
-    const auto maskStride = static_cast<std::size_t>((width + 31) / 32 * 4);
-    const auto colorBytes = static_cast<std::size_t>(width) * height * 4;
-    const auto imageBytes = 40 + colorBytes + maskStride * height;
-    out.assign(22 + imageBytes, 0);
-    const auto put16 = [&](std::size_t at, unsigned value) { out[at] = static_cast<std::uint8_t>(value); out[at + 1] = static_cast<std::uint8_t>(value >> 8); };
-    const auto put32 = [&](std::size_t at, std::uint32_t value) { for (int i = 0; i < 4; ++i) out[at + i] = static_cast<std::uint8_t>(value >> (8 * i)); };
-    put16(2, 2); put16(4, 1);
-    out[6] = static_cast<std::uint8_t>(width & 0xff); out[7] = static_cast<std::uint8_t>(height & 0xff);
-    put16(10, hotX); put16(12, hotY);
-    put32(14, static_cast<std::uint32_t>(imageBytes)); put32(18, 22);
-    put32(22, 40); put32(26, static_cast<std::uint32_t>(width)); put32(30, static_cast<std::uint32_t>(height * 2));
-    put16(34, 1); put16(36, 32); put32(42, static_cast<std::uint32_t>(colorBytes + maskStride * height));
-    for (int y = 0; y < height; ++y) {
-        const auto* row = pixels.data() + static_cast<std::size_t>(height - 1 - y) * width * 4;
-        auto* color = out.data() + 62 + static_cast<std::size_t>(y) * width * 4;
-        auto* mask = out.data() + 62 + colorBytes + static_cast<std::size_t>(y) * maskStride;
-        for (int x = 0; x < width; ++x) {
-            const unsigned a = row[x * 4 + 3];
-            for (unsigned channel = 0; channel < 3; ++channel)
-                color[x * 4 + channel] = a ? static_cast<std::uint8_t>(std::min(255u, (row[x * 4 + channel] * 255u + a / 2) / a)) : 0;
-            color[x * 4 + 3] = static_cast<std::uint8_t>(a);
-            if (!a) mask[x / 8] |= static_cast<std::uint8_t>(0x80u >> (x % 8));
-        }
-    }
-    return true;
-}
+bool EncodeMultiCursor(const std::vector<HCURSOR>& images, std::vector<std::uint8_t>& out);
 
-// Rebuilds an animated .ani cursor with every frame decoded at `size` and
-// given the cursor look, keeping its frame order and timing. Returns empty
-// data when the file cannot be processed; the role then keeps its plain
-// animation instead.
-std::vector<std::uint8_t> AnimationWithLook(const std::wstring& path, int size, const CursorAppearance& look) {
+// Rebuilds an animated .ani cursor with every frame decoded at `size` (plus
+// the larger sizes Windows draws it at) and given the cursor look, keeping
+// its frame order and timing. Returns empty data when the file cannot be
+// processed; the role then keeps its plain animation instead.
+std::vector<std::uint8_t> AnimationWithLook(const std::wstring& path, int size, const std::vector<int>& larger,
+                                            const CursorAppearance& look) {
     std::vector<std::uint8_t> file;
     {
         HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -937,11 +945,16 @@ std::vector<std::uint8_t> AnimationWithLook(const std::wstring& path, int size, 
         std::vector<CursorFrame> entries;
         std::wstring ignored;
         if (!ParseCursorDirectory(frame, entries, ignored)) return {};
-        CursorOwner decoded;
-        decoded.value = DecodeStaticFile(frame, entries, size, ignored);
-        if (!decoded.value || !ApplyLook(decoded.value, look, ignored)) return {};
+        OwnedCursors images;
+        images.items.reserve(larger.size() + 1);
+        for (const int target : [&] { std::vector<int> all{size}; all.insert(all.end(), larger.begin(), larger.end()); return all; }()) {
+            HCURSOR decoded = DecodeStaticFile(frame, entries, target, ignored);
+            if (!decoded) return {};
+            images.items.push_back(decoded);
+            if (!ApplyLook(images.items.back(), look, ignored)) return {};
+        }
         std::vector<std::uint8_t> encoded;
-        if (!EncodeCursorFile(decoded.value, encoded)) return {};
+        if (!EncodeMultiCursor(images.items, encoded)) return {};
         styled.push_back(std::move(encoded));
     }
     // anih: frame count at offset 4; frames are icon chunks (flag bit 0).
@@ -966,13 +979,6 @@ std::vector<std::uint8_t> AnimationWithLook(const std::wstring& path, int size, 
     std::vector<std::uint8_t> output;
     append(output, "RIFF", body);
     return output;
-}
-
-HCURSOR LoadStaticFile(const std::wstring& path, int size, std::wstring& error) {
-    std::vector<std::uint8_t> bytes;
-    std::vector<CursorFrame> frames;
-    if (!ReadStaticFile(path, bytes, frames, error)) return nullptr;
-    return DecodeStaticFile(bytes, frames, size, error);
 }
 
 bool SameCursorArtwork(HCURSOR first, HCURSOR second) {
@@ -1012,10 +1018,21 @@ struct StaticArtwork {
     HCURSOR Make(int size, std::wstring& error) const {
         return DecodeStaticFile(bytes, frames, size, error);
     }
+    // The theme file is restored the way Windows loads the scheme
+    // (LR_DEFAULTSIZE), which reproduces the installed cursor exactly; the
+    // second comparison only covers how Windows reports an installed
+    // cursor's image under a larger pointer size.
     bool ReadMatching(const std::wstring& path, HCURSOR original) {
         if (path.empty()) return false;
         std::wstring ignored;
         if (!Read(path, ignored)) return false;
+        // Load the file the way Windows loads the scheme: with a larger
+        // pointer size or display scale it reports an image derived from
+        // the larger embedded one, not the file's own nominal image.
+        CursorOwner loaded;
+        loaded.value = reinterpret_cast<HCURSOR>(LoadImageW(nullptr, path.c_str(), IMAGE_CURSOR, 0, 0,
+                                                            LR_LOADFROMFILE | LR_DEFAULTSIZE));
+        if (loaded.value && SameCursorArtwork(original, loaded.value)) return true;
         int width = 0, height = 0; DWORD x = 0, y = 0;
         if (!CursorDimensions(original, width, height, x, y, ignored)) return false;
         CursorOwner candidate; candidate.value = Make(std::max(width, height), ignored);
@@ -1107,10 +1124,18 @@ HCURSOR LoadClassicArrow(int size, bool originalSize, std::wstring& error) {
     // Derive its light appearance from the same artwork; do not substitute this
     // legacy silhouette for the modern Windows arrow preset. Explicit sizes
     // use final-resolution Classic geometry below instead of stretching it.
+    // The file is used only when it has an image of exactly this size;
+    // any other size is drawn from the silhouette, never resampled.
     const auto path = originalSize ? LocalWindowsCursor(L"arrow_r.cur") : std::wstring{};
-    if (!path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    std::vector<std::uint8_t> classicBytes;
+    std::vector<CursorFrame> classicFrames;
+    std::wstring readError;
+    const bool exactFrame = !path.empty() && ReadStaticFile(path, classicBytes, classicFrames, readError) &&
+        std::any_of(classicFrames.begin(), classicFrames.end(), [size](const CursorFrame& frame) {
+            return static_cast<int>(std::max(frame.width, frame.height)) == size; });
+    if (exactFrame) {
         CursorOwner dark;
-        dark.value = LoadStaticFile(path, size, error);
+        dark.value = DecodeStaticFile(classicBytes, classicFrames, size, error);
         if (dark.value) {
             const HCURSOR light = CreateInvertedCursor(dark.value, error);
             if (light) return light;
@@ -1119,6 +1144,467 @@ HCURSOR LoadClassicArrow(int size, bool originalSize, std::wstring& error) {
         error.clear();
     }
     return CreateClassicArrow(size, error);
+}
+
+// ---- Scalable cursor files -------------------------------------------------
+//
+// Windows draws every cursor at its nominal size times the pointer size
+// (Accessibility > Mouse pointer, stored as CursorBaseSize/32) and the display
+// scale of the monitor under it. A cursor made from a single bitmap
+// (CreateIconIndirect, CopyImage, CopyIcon) is stretched to that size, which
+// looks pixelated or soft. A cursor loaded from a cursor file keeps every
+// image of the file and Windows draws the image that matches, exactly like
+// the installed theme. ClickShade therefore writes each prepared appearance
+// as a multi-size .cur/.ani file and installs it with LoadImage.
+
+using GetDpiForMonitorFunction = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+
+BOOL CALLBACK CollectMonitorScale(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+    static const auto getDpi = [] {
+        HMODULE shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return shcore ? reinterpret_cast<GetDpiForMonitorFunction>(
+            reinterpret_cast<void*>(GetProcAddress(shcore, "GetDpiForMonitor"))) : nullptr;
+    }();
+    UINT x = 96, y = 96;
+    if (!getDpi || FAILED(getDpi(monitor, 0 /* MDT_EFFECTIVE_DPI */, &x, &y)) || !x) x = 96;
+    reinterpret_cast<std::vector<double>*>(data)->push_back(std::clamp(x / 96.0, 1.0, 8.0));
+    return TRUE;
+}
+
+// Every factor Windows may apply to a nominal cursor size on this desktop.
+// The pointer size alone is included too, so a frame exists whether or not
+// Windows also applies a monitor's display scale.
+std::vector<double> CursorDrawFactors() {
+    DWORD base = 32, bytes = sizeof(base);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Control Panel\\Cursors", L"CursorBaseSize", RRF_RT_REG_DWORD,
+                     nullptr, &base, &bytes) != ERROR_SUCCESS) base = 32;
+    const double pointer = std::clamp(static_cast<double>(base), 32.0, 256.0) / 32.0;
+    std::vector<double> monitors;
+    EnumDisplayMonitors(nullptr, nullptr, CollectMonitorScale, reinterpret_cast<LPARAM>(&monitors));
+    std::vector<double> factors{pointer};
+    for (const double scale : monitors) factors.push_back(pointer * scale);
+    std::sort(factors.begin(), factors.end());
+    factors.erase(std::unique(factors.begin(), factors.end(),
+        [](double a, double b) { return std::abs(a - b) < 0.01; }), factors.end());
+    return factors;
+}
+
+// Longest-side sizes of the extra images a cursor of `nominal` size needs.
+std::vector<int> ExtraFrameSizes(int nominal, const std::vector<double>& factors) {
+    std::vector<int> sizes;
+    for (const double factor : factors) {
+        const int size = std::min(256, static_cast<int>(std::lround(nominal * factor)));
+        if (size > nominal) sizes.push_back(size);
+    }
+    std::sort(sizes.begin(), sizes.end());
+    sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+    return sizes;
+}
+
+int LongestSide(HCURSOR cursor) noexcept {
+    int width = 0, height = 0; DWORD x = 0, y = 0; std::wstring ignored;
+    return cursor && CursorDimensions(cursor, width, height, x, y, ignored) ? std::max(width, height) : 0;
+}
+
+// One cursor image as CUR entry data: a 32-bit DIB with its AND mask. Alpha
+// artwork is written exactly as GetIconInfo returns it, so the cursor Windows
+// loads back has the same pixels and mask. Legacy masks are converted to alpha
+// losslessly; genuine background-inverting artwork cannot be written.
+bool EncodeCursorImage(HCURSOR cursor, std::vector<std::uint8_t>& image, int& width, int& height,
+                       DWORD& hotX, DWORD& hotY) {
+    std::wstring ignored;
+    if (!CursorDimensions(cursor, width, height, hotX, hotY, ignored) || width > 256 || height > 256) return false;
+    IconBitmaps bits;
+    if (!GetIconInfo(cursor, &bits.info)) return false;
+    ScreenDC dc;
+    if (!dc.value) return false;
+    const std::size_t pixelCount = static_cast<std::size_t>(width) * height;
+    const std::size_t stride = static_cast<std::size_t>((width + 31) / 32 * 4);
+    std::vector<std::uint8_t> pixels(pixelCount * 4, 0), mask(stride * height, 0);
+    bool alpha = false;
+    if (bits.info.hbmColor) {
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = height; // bottom-up, as in files
+        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+        if (GetDIBits(dc.value, bits.info.hbmColor, 0, height, pixels.data(), &info, DIB_RGB_COLORS) != height) return false;
+        for (std::size_t i = 3; i < pixels.size() && !alpha; i += 4) alpha |= pixels[i] != 0;
+    }
+    if (alpha) {
+        BITMAP description{};
+        if (!bits.info.hbmMask || !GetObjectW(bits.info.hbmMask, sizeof(description), &description) ||
+            description.bmWidth != width || description.bmHeight < height) return false;
+        struct { BITMAPINFOHEADER header; RGBQUAD colors[2]; } maskInfo{};
+        maskInfo.header.biSize = sizeof(BITMAPINFOHEADER);
+        maskInfo.header.biWidth = width; maskInfo.header.biHeight = description.bmHeight;
+        maskInfo.header.biPlanes = 1; maskInfo.header.biBitCount = 1; maskInfo.header.biCompression = BI_RGB;
+        std::vector<std::uint8_t> planes(stride * description.bmHeight, 0);
+        if (GetDIBits(dc.value, bits.info.hbmMask, 0, description.bmHeight, planes.data(),
+                      reinterpret_cast<BITMAPINFO*>(&maskInfo), DIB_RGB_COLORS) != description.bmHeight) return false;
+        // Bottom-up rows: the AND plane is the top `height` rows of the mask.
+        std::copy_n(planes.data() + stride * (description.bmHeight - height), stride * height, mask.data());
+    } else {
+        std::vector<std::uint8_t> premultiplied;
+        int w = 0, h = 0; DWORD x = 0, y = 0;
+        if (!ReadPremultiplied(cursor, premultiplied, w, h, x, y, ignored) || w != width || h != height) return false;
+        UnpremultiplyBgra(premultiplied.data(), pixelCount);
+        for (int row = 0; row < height; ++row) {
+            const auto* source = premultiplied.data() + static_cast<std::size_t>(height - 1 - row) * width * 4;
+            std::copy_n(source, static_cast<std::size_t>(width) * 4, pixels.data() + static_cast<std::size_t>(row) * width * 4);
+            for (int x2 = 0; x2 < width; ++x2)
+                if (!source[x2 * 4 + 3]) mask[static_cast<std::size_t>(row) * stride + x2 / 8] |= static_cast<std::uint8_t>(0x80u >> (x2 % 8));
+        }
+    }
+    image.assign(40 + pixels.size() + mask.size(), 0);
+    const auto put16 = [&](std::size_t at, unsigned value) { image[at] = static_cast<std::uint8_t>(value); image[at + 1] = static_cast<std::uint8_t>(value >> 8); };
+    const auto put32 = [&](std::size_t at, std::uint32_t value) { for (int i = 0; i < 4; ++i) image[at + i] = static_cast<std::uint8_t>(value >> (8 * i)); };
+    put32(0, 40); put32(4, static_cast<std::uint32_t>(width)); put32(8, static_cast<std::uint32_t>(height * 2));
+    put16(12, 1); put16(14, 32); put32(20, static_cast<std::uint32_t>(pixels.size() + mask.size()));
+    std::copy(pixels.begin(), pixels.end(), image.begin() + 40);
+    std::copy(mask.begin(), mask.end(), image.begin() + 40 + static_cast<std::ptrdiff_t>(pixels.size()));
+    return true;
+}
+
+// A .cur file holding every given image (same artwork at different sizes).
+bool EncodeMultiCursor(const std::vector<HCURSOR>& images, std::vector<std::uint8_t>& out) {
+    struct Entry { std::vector<std::uint8_t> data; int width, height; DWORD hotX, hotY; };
+    std::vector<Entry> entries;
+    for (const HCURSOR image : images) {
+        Entry entry{};
+        if (!image || !EncodeCursorImage(image, entry.data, entry.width, entry.height, entry.hotX, entry.hotY)) return false;
+        entries.push_back(std::move(entry));
+    }
+    if (entries.empty() || entries.size() > 64) return false;
+    out.assign(6 + 16 * entries.size(), 0);
+    out[2] = 2; out[4] = static_cast<std::uint8_t>(entries.size());
+    std::uint32_t offset = static_cast<std::uint32_t>(out.size());
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        auto* e = out.data() + 6 + 16 * i;
+        e[0] = static_cast<std::uint8_t>(entries[i].width & 0xff);   // 256 is stored as zero
+        e[1] = static_cast<std::uint8_t>(entries[i].height & 0xff);
+        e[4] = static_cast<std::uint8_t>(entries[i].hotX); e[5] = static_cast<std::uint8_t>(entries[i].hotX >> 8);
+        e[6] = static_cast<std::uint8_t>(entries[i].hotY); e[7] = static_cast<std::uint8_t>(entries[i].hotY >> 8);
+        const auto bytes = static_cast<std::uint32_t>(entries[i].data.size());
+        for (int k = 0; k < 4; ++k) { e[8 + k] = static_cast<std::uint8_t>(bytes >> (8 * k)); e[12 + k] = static_cast<std::uint8_t>(offset >> (8 * k)); }
+        offset += bytes;
+    }
+    for (const auto& entry : entries) out.insert(out.end(), entry.data.begin(), entry.data.end());
+    return true;
+}
+
+// The image Windows draws for a live cursor at width x height, recovered by
+// drawing it over black and over white. For the size Windows currently draws
+// the cursor at, this is its exact embedded image, including built-in cursors
+// and accessibility recoloring that have no file. Returns null for artwork
+// that inverts the background, which alpha cannot represent.
+HCURSOR ExtractDrawnCursor(HCURSOR live, int width, int height, DWORD hotX, DWORD hotY) {
+    ScreenDC screen;
+    if (!screen.value || width < 1 || height < 1 || width > 256 || height > 256) return nullptr;
+    HDC dc = CreateCompatibleDC(screen.value);
+    if (!dc) return nullptr;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    const std::size_t bytes = static_cast<std::size_t>(width) * height * 4;
+    std::vector<std::uint8_t> planes[2];
+    bool ok = true;
+    for (int pass = 0; pass < 2 && ok; ++pass) {
+        void* bits = nullptr;
+        BitmapOwner target;
+        target.value = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!target.value || !bits) { ok = false; break; }
+        const HGDIOBJ previous = SelectObject(dc, target.value);
+        std::memset(bits, pass ? 255 : 0, bytes);
+        ok = DrawIconEx(dc, 0, 0, live, width, height, 0, nullptr, DI_NORMAL) != FALSE;
+        GdiFlush();
+        planes[pass].assign(static_cast<std::uint8_t*>(bits), static_cast<std::uint8_t*>(bits) + bytes);
+        SelectObject(dc, previous);
+    }
+    DeleteDC(dc);
+    if (!ok) return nullptr;
+    std::vector<std::uint8_t> premultiplied(bytes, 0);
+    for (std::size_t i = 0; i < bytes; i += 4) {
+        int alpha = 0;
+        for (int c = 0; c < 3; ++c) {
+            if (planes[1][i + c] < planes[0][i + c]) return nullptr; // background inversion
+            alpha = std::max(alpha, 255 - (planes[1][i + c] - planes[0][i + c]));
+        }
+        premultiplied[i + 3] = static_cast<std::uint8_t>(std::clamp(alpha, 0, 255));
+        for (int c = 0; c < 3; ++c)
+            premultiplied[i + c] = static_cast<std::uint8_t>(std::min<int>(planes[0][i + c], premultiplied[i + 3]));
+    }
+    std::wstring ignored;
+    return CursorFromPremultiplied(premultiplied, width, height,
+        std::min<DWORD>(hotX, static_cast<DWORD>(width - 1)), std::min<DWORD>(hotY, static_cast<DWORD>(height - 1)), ignored);
+}
+
+bool ProcessElevated() noexcept {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{}; DWORD returned = 0;
+    const bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &returned) &&
+                          elevation.TokenIsElevated != 0;
+    CloseHandle(token);
+    return elevated;
+}
+
+bool PlainDirectory(const std::wstring& path) noexcept {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+           !(attributes & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
+void UnlockCacheFolder(const std::wstring& folder) noexcept;
+
+// Deletes only what ClickShade writes there: .cur/.ani files and generation
+// subfolders, never following links.
+void RemoveCacheFolder(const std::wstring& folder) noexcept {
+    UnlockCacheFolder(folder);
+    if (folder.empty() || !PlainDirectory(folder)) return;
+    WIN32_FIND_DATAW entry{};
+    HANDLE find = FindFirstFileW((folder + L"\\*").c_str(), &entry);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name = entry.cFileName;
+            if (name == L"." || name == L"..") continue;
+            const std::wstring path = folder + L"\\" + name;
+            if (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (name.size() > 1 && name[0] == L'g') RemoveCacheFolder(path);
+                continue;
+            }
+            const auto dot = name.rfind(L'.');
+            const std::wstring extension = dot == std::wstring::npos ? L"" : name.substr(dot);
+            if (_wcsicmp(extension.c_str(), L".cur") == 0 || _wcsicmp(extension.c_str(), L".ani") == 0)
+                DeleteFileW(path.c_str());
+        } while (FindNextFileW(find, &entry));
+        FindClose(find);
+    }
+    RemoveDirectoryW(folder.c_str());
+}
+
+// Read handles that keep ClickShade's cursor files from being deleted or
+// replaced while they can still be installed: temporary-file cleaners and
+// other programs get a sharing violation. Windows' own LoadImage reads them
+// fine. The registry is never destroyed, so engines in static storage can
+// still unlock at exit.
+struct CacheLocks {
+    std::mutex mutex;
+    std::vector<std::pair<std::wstring, HANDLE>> files;
+};
+
+CacheLocks& Locks() noexcept {
+    static CacheLocks* locks = new CacheLocks;
+    return *locks;
+}
+
+// Locks the file at `path` if it is still the file `written` describes;
+// anything else (the path was swapped meanwhile) is refused.
+bool LockCacheFile(const std::wstring& path, const BY_HANDLE_FILE_INFORMATION& written) noexcept {
+    const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION opened{};
+    if (!GetFileInformationByHandle(handle, &opened) || opened.dwVolumeSerialNumber != written.dwVolumeSerialNumber ||
+        opened.nFileIndexHigh != written.nFileIndexHigh || opened.nFileIndexLow != written.nFileIndexLow) {
+        CloseHandle(handle);
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> guard(Locks().mutex);
+        Locks().files.emplace_back(path, handle);
+        return true;
+    } catch (...) {
+        CloseHandle(handle);
+        return false;
+    }
+}
+
+void UnlockCacheFolder(const std::wstring& folder) noexcept {
+    if (folder.empty()) return;
+    try {
+        const std::wstring prefix = folder + L"\\";
+        std::lock_guard<std::mutex> guard(Locks().mutex);
+        auto& files = Locks().files;
+        for (auto entry = files.begin(); entry != files.end();) {
+            if (entry->first.compare(0, prefix.size(), prefix) == 0) {
+                CloseHandle(entry->second);
+                entry = files.erase(entry);
+            } else {
+                ++entry;
+            }
+        }
+    } catch (...) {}
+}
+
+bool ProcessRunning(DWORD id) noexcept {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, id);
+    if (!process) return GetLastError() == ERROR_ACCESS_DENIED; // exists, belongs to someone else
+    DWORD code = 0;
+    const bool running = GetExitCodeProcess(process, &code) && code == STILL_ACTIVE;
+    CloseHandle(process);
+    return running;
+}
+
+// A private temporary folder per engine for its generated cursor files:
+// %TEMP%\ClickShade\cursors\<process>-<tick>-<n>\g<k>\*.cur. Each file stays
+// open for reading while its generation is in use, so it cannot be deleted
+// or replaced. Folders of ended processes are removed on start, but never by
+// an elevated instance: it does not delete by path inside folders that
+// ordinary programs can change. While elevated the folder carries a high
+// integrity label, so ordinary programs cannot write into it.
+class CursorCache {
+public:
+    CursorCache() = default;
+    CursorCache(const CursorCache&) = delete;
+    CursorCache& operator=(const CursorCache&) = delete;
+    ~CursorCache() { RemoveCacheFolder(root_); }
+
+    // An empty folder for one prepared configuration, or empty when files
+    // cannot be written (cursors then fall back to bitmap copies).
+    std::wstring NewGeneration() noexcept {
+        try {
+            if (!EnsureRoot()) return {};
+            for (unsigned attempt = 0; attempt < 16; ++attempt) {
+                const std::wstring folder = root_ + L"\\g" + std::to_wstring(++generation_);
+                if (CreateDirectoryW(folder.c_str(), nullptr)) return folder;
+            }
+        } catch (...) {}
+        return {};
+    }
+
+    static bool Write(const std::wstring& folder, const std::wstring& name,
+                      const std::vector<std::uint8_t>& bytes, std::wstring& path) noexcept {
+        try {
+            if (folder.empty() || bytes.empty()) return false;
+            path = folder + L"\\" + name;
+            HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                      FILE_ATTRIBUTE_TEMPORARY, nullptr);
+            if (file == INVALID_HANDLE_VALUE) return false;
+            DWORD written = 0;
+            BY_HANDLE_FILE_INFORMATION identity{};
+            const bool ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+                            written == bytes.size() && GetFileInformationByHandle(file, &identity);
+            CloseHandle(file);
+            if (!ok) { DeleteFileW(path.c_str()); return false; }
+            // Installed only while locked: then it can be neither deleted nor
+            // replaced, and no folder above it can be renamed.
+            return LockCacheFile(path, identity);
+        } catch (...) { return false; }
+    }
+
+private:
+    bool EnsureRoot() {
+        if (!root_.empty()) {
+            if (PlainDirectory(root_)) return true;
+            // Removed from outside (only possible between generations):
+            // start a new folder instead of giving up on files for good.
+            UnlockCacheFolder(root_);
+            root_.clear();
+        }
+        std::array<wchar_t, MAX_PATH + 1> temp{};
+        const DWORD length = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
+        if (!length || length >= temp.size()) return false;
+        std::wstring base(temp.data(), length);
+        if (!base.empty() && base.back() == L'\\') base.pop_back();
+        base += L"\\ClickShade";
+        CreateDirectoryW(base.c_str(), nullptr);
+        if (!PlainDirectory(base)) return false;
+        base += L"\\cursors";
+        CreateDirectoryW(base.c_str(), nullptr);
+        if (!PlainDirectory(base)) return false;
+        const bool elevated = ProcessElevated();
+        if (!elevated) RemoveEndedInstances(base);
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, FALSE};
+        if (elevated && ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"S:(ML;OICI;NWNRNX;;;HI)", SDDL_REVISION_1, &descriptor, nullptr))
+            attributes.lpSecurityDescriptor = descriptor;
+        bool created = false;
+        for (unsigned attempt = 0; attempt < 16 && !created; ++attempt) {
+            const std::wstring candidate = base + L"\\" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
+            if (CreateDirectoryW(candidate.c_str(), &attributes)) { root_ = candidate; created = true; }
+        }
+        if (descriptor) LocalFree(descriptor);
+        return created && PlainDirectory(root_);
+    }
+
+    static void RemoveEndedInstances(const std::wstring& base) noexcept {
+        WIN32_FIND_DATAW entry{};
+        HANDLE find = FindFirstFileW((base + L"\\*").c_str(), &entry);
+        if (find == INVALID_HANDLE_VALUE) return;
+        do {
+            if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+            const std::wstring name = entry.cFileName;
+            const auto dash = name.find(L'-');
+            if (dash == 0 || dash == std::wstring::npos) continue;
+            DWORD id = 0; bool digits = true;
+            for (std::size_t i = 0; i < dash && digits; ++i) {
+                digits = name[i] >= L'0' && name[i] <= L'9';
+                id = id * 10 + static_cast<DWORD>(name[i] - L'0');
+            }
+            if (digits && id && id != GetCurrentProcessId() && !ProcessRunning(id)) RemoveCacheFolder(base + L"\\" + name);
+        } while (FindNextFileW(find, &entry));
+        FindClose(find);
+    }
+
+    std::wstring root_;
+    unsigned generation_ = 0;
+};
+
+// Where each prepared master image is installed from.
+struct CursorFile {
+    HCURSOR master = nullptr;   // Non-owning: the slot's or level's prepared image.
+    std::wstring path;
+    int width = 0, height = 0;  // Nominal size passed to LoadImage.
+    bool defaultSize = false;   // Load like Windows loads the theme (LR_DEFAULTSIZE).
+};
+
+struct CursorCatalog {
+    std::wstring folder;                 // Generation folder; empty disables files.
+    std::vector<double> factors{1.0};
+    std::vector<CursorFile> files;
+    unsigned next = 0;
+
+    const CursorFile* Find(HCURSOR master) const noexcept {
+        if (!master) return nullptr;
+        for (const auto& file : files) if (file.master == master) return &file;
+        return nullptr;
+    }
+
+    // Writes `master` and its larger renderings as one multi-size cursor file.
+    // On any failure the master keeps the bitmap-copy installation.
+    void Add(HCURSOR master, const std::vector<HCURSOR>& larger) noexcept {
+        try {
+            if (folder.empty() || !master) return;
+            int width = 0, height = 0; DWORD x = 0, y = 0; std::wstring ignored;
+            if (!CursorDimensions(master, width, height, x, y, ignored)) return;
+            std::vector<HCURSOR> images{master};
+            images.insert(images.end(), larger.begin(), larger.end());
+            std::vector<std::uint8_t> bytes;
+            if (!EncodeMultiCursor(images, bytes)) return;
+            CursorFile file;
+            if (!CursorCache::Write(folder, std::to_wstring(++next) + L".cur", bytes, file.path)) return;
+            file.master = master; file.width = width; file.height = height;
+            files.push_back(std::move(file));
+        } catch (...) {}
+    }
+
+    void AddExisting(HCURSOR master, const std::wstring& path) noexcept {
+        try {
+            if (!master || path.empty()) return;
+            CursorFile file; file.master = master; file.path = path; file.defaultSize = true;
+            files.push_back(std::move(file));
+        } catch (...) {}
+    }
+};
+
+HCURSOR LoadCursorFile(const CursorFile& file) noexcept {
+    return reinterpret_cast<HCURSOR>(LoadImageW(nullptr, file.path.c_str(), IMAGE_CURSOR,
+        file.defaultSize ? 0 : file.width, file.defaultSize ? 0 : file.height,
+        LR_LOADFROMFILE | (file.defaultSize ? LR_DEFAULTSIZE : 0)));
 }
 
 struct CursorSlot {
@@ -1138,9 +1624,22 @@ struct CursorSlot {
     // press/shake effects leave it alone, and restoration reloads the scheme.
     bool animated = false;
     int animatedSize = 0;
-    // An animation rebuilt with the cursor look; installation creates the
-    // cursor from these .ani bytes instead of reloading the file.
-    std::vector<std::uint8_t> animation;
+    // The rebuilt animation's own nominal size (its finished first image,
+    // shadow included); the scheme file fallback keeps animatedSize.
+    int animationFileSize = 0;
+    // The captured role was animated, so restoration reloads the scheme
+    // instead of installing a flattened snapshot (also after a static arrow
+    // preset turned the role static).
+    bool schemeRestore = false;
+    // An animation rebuilt with the cursor look, written to the cache folder;
+    // installation loads it instead of the registered file.
+    std::wstring animationFile;
+    // The registered theme file when it matches the captured artwork. The
+    // original is then reinstalled exactly as Windows loads it.
+    std::wstring originalFile;
+    // Without a matching file: the live cursor's images at the sizes Windows
+    // draws it, captured before ClickShade replaced anything.
+    std::vector<HCURSOR> drawnImages;
 
     CursorSlot() = default;
     CursorSlot(const CursorSlot&) = delete;
@@ -1152,16 +1651,43 @@ struct CursorSlot {
           inverted(std::exchange(other.inverted, nullptr)), applied(other.applied),
           sourcePath(std::move(other.sourcePath)), touched(other.touched),
           pressedApplied(other.pressedApplied), baselineChanged(other.baselineChanged),
-          animated(other.animated), animatedSize(other.animatedSize), animation(std::move(other.animation)) {}
+          animated(other.animated), animatedSize(other.animatedSize), animationFileSize(other.animationFileSize),
+          schemeRestore(other.schemeRestore),
+          animationFile(std::move(other.animationFile)),
+          originalFile(std::move(other.originalFile)), drawnImages(std::move(other.drawnImages)) {
+        other.drawnImages.clear();
+    }
     CursorSlot& operator=(CursorSlot&&) = delete;
     ~CursorSlot() {
         if (original) DestroyCursor(original);
         if (released) DestroyCursor(released);
         if (inverted) DestroyCursor(inverted);
+        for (const HCURSOR image : drawnImages) if (image) DestroyCursor(image);
     }
 };
 
-bool CaptureOriginals(std::vector<CursorSlot>& slots, std::wstring& error) {
+// Finds the theme's own file, or captures the live images Windows draws, so
+// every size of the user's cursor can be reproduced exactly.
+void CaptureDrawnSources(CursorSlot& slot, const std::vector<double>& factors) {
+    if (slot.animated || !slot.original) return;
+    StaticArtwork file;
+    if (file.ReadMatching(slot.sourcePath, slot.original)) {
+        slot.originalFile = slot.sourcePath;
+        return;
+    }
+    int width = 0, height = 0; DWORD hotX = 0, hotY = 0; std::wstring ignored;
+    if (!CursorDimensions(slot.original, width, height, hotX, hotY, ignored)) return;
+    const int longest = std::max(width, height);
+    for (const int size : ExtraFrameSizes(longest, factors)) {
+        const int w = std::max(1, MulDiv(width, size, longest)), h = std::max(1, MulDiv(height, size, longest));
+        const HCURSOR image = ExtractDrawnCursor(slot.shared, w, h,
+            static_cast<DWORD>(MulDiv(static_cast<int>(hotX), w, width)), static_cast<DWORD>(MulDiv(static_cast<int>(hotY), h, height)));
+        if (!image) break; // background-inverting artwork: keep the bitmap path
+        slot.drawnImages.push_back(image);
+    }
+}
+
+bool CaptureOriginals(std::vector<CursorSlot>& slots, const std::vector<double>& factors, std::wstring& error) {
     slots.reserve(std::size(kRoles));
     for (const Role& role : kRoles) {
         auto path = RegisteredCursorPath(role.registryName);
@@ -1175,6 +1701,7 @@ bool CaptureOriginals(std::vector<CursorSlot>& slots, std::wstring& error) {
         if (aniFile || curFile) slot.sourcePath = std::move(path);
         // Wait/AppStarting without a registered file are built-in animations.
         slot.animated = aniFile || (slot.sourcePath.empty() && (role.id == kWaitCursor || role.id == kAppStartingCursor));
+        slot.schemeRestore = slot.animated;
         slot.shared = LoadCursorW(nullptr, MAKEINTRESOURCEW(role.id));
         if (!slot.shared) continue;
         slot.original = CopyOwnedCursor(slot.shared);
@@ -1182,6 +1709,7 @@ bool CaptureOriginals(std::vector<CursorSlot>& slots, std::wstring& error) {
             error = WinError(L"Could not save an original system cursor", GetLastError());
             return false;
         }
+        CaptureDrawnSources(slot, factors);
         slots.push_back(std::move(slot));
     }
     if (slots.empty()) {
@@ -1264,7 +1792,7 @@ bool BuildMagnification(std::vector<MagnifiedArrow>& output, const CursorSlot& a
 }
 
 bool BuildArtwork(std::vector<CursorSlot>& slots, const CursorAppearance& requested,
-                  std::vector<MagnifiedArrow>& magnifications, std::wstring& error) {
+                  std::vector<MagnifiedArrow>& magnifications, CursorCatalog& catalog, std::wstring& error) {
     if (requested.style < 0 || requested.style > 3 ||
         (requested.size != 0 && (requested.size < 24 || requested.size > 256)) ||
         requested.scale < 100 || requested.scale > 600 || requested.opacity < 30 || requested.opacity > 100 ||
@@ -1292,22 +1820,38 @@ bool BuildArtwork(std::vector<CursorSlot>& slots, const CursorAppearance& reques
     for (auto& slot : slots) {
         const bool customArrow = slot.id == kNormalCursor && appearance.style != 0;
         if (slot.animated && !customArrow) {
-            // Keep the animation: Windows reloads the file at the requested size
+            // Keep the animation. A resized or styled one is rebuilt with every
+            // frame at each size Windows draws it, like the static cursors;
+            // if that fails Windows reloads the file at the requested size
             // (its own frames, stretched beyond the largest one). The role is
             // neither inverted nor magnified, and stays untouched at source size.
-            slot.released = nullptr; slot.inverted = nullptr; slot.baselineChanged = false; slot.animatedSize = 0;
-            slot.animation.clear();
-            if (LookActive(appearance) && !slot.sourcePath.empty()) {
+            slot.released = nullptr; slot.inverted = nullptr; slot.baselineChanged = false;
+            slot.animatedSize = slot.animationFileSize = 0;
+            slot.animationFile.clear();
+            if ((LookActive(appearance) || appearance.size) && !slot.sourcePath.empty()) {
                 int size = appearance.size, width = 0, height = 0; DWORD hotX = 0, hotY = 0;
                 std::wstring ignored;
                 if (!size && CursorDimensions(slot.original, width, height, hotX, hotY, ignored)) size = std::max(width, height);
-                auto styled = size ? AnimationWithLook(slot.sourcePath, size, appearance) : std::vector<std::uint8_t>{};
-                const HCURSOR created = styled.empty() ? nullptr : reinterpret_cast<HCURSOR>(CreateIconFromResourceEx(
-                    styled.data(), static_cast<DWORD>(styled.size()), FALSE, 0x00030000, 0, 0, 0));
-                if (created) {
-                    slot.released = created; slot.animatedSize = size; slot.animation = std::move(styled);
-                    slot.baselineChanged = true;
-                    continue;
+                // A shadow grows every frame: the file is installed at the
+                // finished size, and each larger frame is built so that its
+                // finished size is one Windows draws, as for static cursors.
+                const int finished = size && appearance.shadow ? ShadowedSide(size) : size;
+                std::vector<int> larger;
+                for (const int target : ExtraFrameSizes(finished, catalog.factors)) {
+                    const int side = ArtworkSideFor(target, appearance);
+                    if (side > (larger.empty() ? size : larger.back())) larger.push_back(side);
+                }
+                const auto styled = size ? AnimationWithLook(slot.sourcePath, size, larger, appearance)
+                                         : std::vector<std::uint8_t>{};
+                std::wstring path;
+                if (!styled.empty() && CursorCache::Write(catalog.folder, std::to_wstring(++catalog.next) + L".ani", styled, path)) {
+                    const HCURSOR created = reinterpret_cast<HCURSOR>(LoadImageW(nullptr, path.c_str(), IMAGE_CURSOR, finished, finished, LR_LOADFROMFILE));
+                    if (created) {
+                        slot.released = created; slot.animatedSize = size; slot.animationFileSize = finished;
+                        slot.animationFile = std::move(path);
+                        slot.baselineChanged = true;
+                        continue;
+                    }
                 }
             }
             if (appearance.size && !slot.sourcePath.empty()) {
@@ -1317,6 +1861,9 @@ bool BuildArtwork(std::vector<CursorSlot>& slots, const CursorAppearance& reques
             }
             continue;
         }
+        // A static arrow preset replaces an animated arrow: from here on the
+        // role is static, so press and shake reach it.
+        if (customArrow) slot.animated = false;
         StaticArtwork releasedFile, pressedFile;
         bool useReleasedFile = false, usePressedFile = false;
         int nativeSize = 0;
@@ -1345,19 +1892,36 @@ bool BuildArtwork(std::vector<CursorSlot>& slots, const CursorAppearance& reques
             // Registry access and all optional file reads happen only while
             // configuring. A mismatched/missing file falls back to the saved
             // current artwork rather than replacing it with a different theme.
-            if (appearance.size || (slot.id == kNormalCursor && appearance.maximumMagnification > 1.f))
-                useReleasedFile = releasedFile.ReadMatching(slot.sourcePath, slot.original);
+            useReleasedFile = !slot.originalFile.empty() && releasedFile.Read(slot.originalFile, error);
+            error.clear();
         }
         if (customArrow && (appearance.style == 1 || appearance.style == 2)) {
             int width = 0, height = 0; DWORD x = 0, y = 0;
             if (!CursorDimensions(slot.original, width, height, x, y, error)) return false;
             nativeSize = std::max(width, height);
         }
+        // The best source for the user's own cursor at `size`: its theme
+        // file, else the image Windows drew at that size, else the nearest
+        // larger captured image (or the snapshot) resampled.
+        const auto themeAt = [&](int size) {
+            HCURSOR best = nullptr; int bestSide = 0;
+            for (const HCURSOR image : slot.drawnImages) {
+                const int side = LongestSide(image);
+                if (side == size) return CopyAtSize(image, 0, error);
+                if (side > size && (!best || side < bestSide)) { best = image; bestSide = side; }
+            }
+            if (!best) for (const HCURSOR image : slot.drawnImages) {
+                const int side = LongestSide(image);
+                if (side > bestSide) { best = image; bestSide = side; }
+            }
+            return CopyAtSize(best && bestSide > LongestSide(slot.original) ? best : slot.original, size, error);
+        };
         const auto makeReleased = [&](int size, bool originalSize) {
             if (customArrow && appearance.style == 2)
                 return LoadClassicArrow(size ? size : nativeSize, originalSize, error);
             if (!customArrow && !size) return CopyAtSize(slot.original, 0, error);
             if (useReleasedFile) return releasedFile.Make(size ? size : nativeSize, error);
+            if (!customArrow) return themeAt(size);
             return CopyAtSize(slot.original, size, error);
         };
         const auto makePressed = [&](HCURSOR released, int size) {
@@ -1378,6 +1942,63 @@ bool BuildArtwork(std::vector<CursorSlot>& slots, const CursorAppearance& reques
         for (std::size_t level = firstLevel; level < magnifications.size(); ++level)
             if (!ApplyLook(magnifications[level].released, appearance, error) ||
                 !ApplyLook(magnifications[level].pressed, appearance, error)) return false;
+
+        // Every installed state also gets the sizes Windows draws it at, so
+        // pointer size and display scaling never stretch a bitmap. Windows
+        // scales the finished master, so each target is a multiple of its
+        // size; a shadow grows the artwork, so the artwork is built at the
+        // size that the shadow grows to the target.
+        // The artwork sizes for a finished master's extra images: each size
+        // Windows draws that master at, mapped back through the look, ascending.
+        const auto extraSides = [&](HCURSOR master) {
+            std::vector<int> sides;
+            for (const int target : ExtraFrameSizes(LongestSide(master), catalog.factors)) {
+                const int side = ArtworkSideFor(target, appearance);
+                if (sides.empty() || side > sides.back()) sides.push_back(side);
+            }
+            return sides;
+        };
+        const auto addScalable = [&](HCURSOR releasedMaster, HCURSOR pressedMaster) -> bool {
+            OwnedCursors releasedImages, pressedImages;
+            // The artwork made as released and as pressed, before any reverse swap.
+            const HCURSOR releasedArt = appearance.reverse ? pressedMaster : releasedMaster;
+            const HCURSOR pressedArt = appearance.reverse ? releasedMaster : pressedMaster;
+            auto& releasedArtImages = appearance.reverse ? pressedImages.items : releasedImages.items;
+            auto& pressedArtImages = appearance.reverse ? releasedImages.items : pressedImages.items;
+            const auto add = [&](std::vector<HCURSOR>& images, HCURSOR image) {
+                images.push_back(image); // Owned from here, also when the look fails.
+                return ApplyLook(images.back(), appearance, error);
+            };
+            if (usePressedFile) {
+                // A custom pressed file can have another size than the released
+                // one: each gets the sizes Windows draws its own master at.
+                for (const int size : extraSides(releasedArt)) {
+                    const HCURSOR up = makeReleased(size, false);
+                    if (!up || !add(releasedArtImages, up)) return false;
+                }
+                for (const int size : extraSides(pressedArt)) {
+                    const HCURSOR down = pressedFile.Make(size, error);
+                    if (!down || !add(pressedArtImages, down)) return false;
+                }
+            } else {
+                for (const int size : extraSides(releasedArt)) {
+                    const HCURSOR up = makeReleased(size, false);
+                    if (!up) return false;
+                    const HCURSOR down = makePressed(up, size);
+                    if (!down) { DestroyCursor(up); return false; }
+                    if (!add(releasedArtImages, up)) { DestroyCursor(down); return false; }
+                    if (!add(pressedArtImages, down)) return false;
+                }
+            }
+            catalog.Add(releasedMaster, releasedImages.items);
+            catalog.Add(pressedMaster, pressedImages.items);
+            return true;
+        };
+        if (!addScalable(slot.released, slot.inverted)) return false;
+        for (std::size_t level = firstLevel; level < magnifications.size(); ++level)
+            if (!addScalable(magnifications[level].released, magnifications[level].pressed)) return false;
+        if (!slot.originalFile.empty()) catalog.AddExisting(slot.original, slot.originalFile);
+        else catalog.Add(slot.original, slot.drawnImages);
     }
     return true;
 }
@@ -1390,18 +2011,26 @@ void RefreshSharedHandle(CursorSlot& slot) noexcept {
     }
 }
 
-bool ReplaceSlot(CursorSlot& slot, HCURSOR source, DWORD& code) noexcept {
-    // Copying an animated cursor keeps only one frame, so an animated role is
-    // reloaded from its file for every installation instead.
+bool ReplaceSlot(CursorSlot& slot, HCURSOR source, const CursorCatalog& catalog, DWORD& code) noexcept {
+    // Copying a cursor keeps one bitmap that Windows stretches, and only one
+    // frame of an animation, so every prepared appearance is loaded from its
+    // multi-size file for each installation. A bitmap copy is the fallback.
     HCURSOR copy = nullptr;
     if (slot.animated && slot.animatedSize && source == slot.released) {
-        copy = !slot.animation.empty()
-            ? reinterpret_cast<HCURSOR>(CreateIconFromResourceEx(const_cast<PBYTE>(slot.animation.data()),
-                  static_cast<DWORD>(slot.animation.size()), FALSE, 0x00030000, 0, 0, 0))
-            : reinterpret_cast<HCURSOR>(LoadImageW(nullptr, slot.sourcePath.c_str(), IMAGE_CURSOR,
-                  slot.animatedSize, slot.animatedSize, LR_LOADFROMFILE));
+        // The animation rebuilt with the look, else the scheme's own file,
+        // else one still frame: installing never fails over a missing file.
+        if (!slot.animationFile.empty()) {
+            const int size = slot.animationFileSize ? slot.animationFileSize : slot.animatedSize;
+            copy = reinterpret_cast<HCURSOR>(LoadImageW(nullptr, slot.animationFile.c_str(), IMAGE_CURSOR,
+                size, size, LR_LOADFROMFILE));
+        }
+        if (!copy && !slot.sourcePath.empty())
+            copy = reinterpret_cast<HCURSOR>(LoadImageW(nullptr, slot.sourcePath.c_str(), IMAGE_CURSOR,
+                slot.animatedSize, slot.animatedSize, LR_LOADFROMFILE));
+        if (!copy) copy = CopyOwnedCursor(source);
     } else {
-        copy = CopyOwnedCursor(source);
+        if (const CursorFile* file = catalog.Find(source)) copy = LoadCursorFile(*file);
+        if (!copy) copy = CopyOwnedCursor(source);
     }
     if (!copy) {
         code = GetLastError();
@@ -1416,11 +2045,11 @@ bool ReplaceSlot(CursorSlot& slot, HCURSOR source, DWORD& code) noexcept {
     return true;
 }
 
-bool ApplySlot(CursorSlot& slot, HCURSOR source, DWORD& code) noexcept {
+bool ApplySlot(CursorSlot& slot, HCURSOR source, const CursorCatalog& catalog, DWORD& code) noexcept {
     if (slot.applied == source || (source == slot.original && !slot.touched)) return true;
     // Mark before the API call so a partial failure still gets restoration.
     slot.touched = true;
-    if (!ReplaceSlot(slot, source, code)) return false;
+    if (!ReplaceSlot(slot, source, catalog, code)) return false;
     slot.applied = source;
     slot.touched = source != slot.original;
     return true;
@@ -1468,6 +2097,9 @@ bool FindCursorCompanion(const std::wstring& selected, std::wstring& companion,
 }
 
 struct CursorEngine::Impl {
+    // Declared first so it is destroyed last, after every slot is restored.
+    CursorCache cache;
+    CursorCatalog catalog;
     std::vector<CursorSlot> slots;
     std::vector<MagnifiedArrow> magnifications;
     CursorAppearance appearance;
@@ -1517,8 +2149,16 @@ bool CursorEngine::Initialize(std::wstring& error) {
     if (impl_->initialized) return true;
     std::vector<CursorSlot> slots;
     std::vector<MagnifiedArrow> magnifications;
-    if (!CaptureOriginals(slots, error)) return false;
-    if (!BuildArtwork(slots, impl_->appearance, magnifications, error)) return false;
+    CursorCatalog catalog;
+    catalog.factors = CursorDrawFactors();
+    if (!CaptureOriginals(slots, catalog.factors, error)) return false;
+    catalog.folder = impl_->cache.NewGeneration();
+    if (!BuildArtwork(slots, impl_->appearance, magnifications, catalog, error)) {
+        RemoveCacheFolder(catalog.folder);
+        return false;
+    }
+    RemoveCacheFolder(impl_->catalog.folder);
+    impl_->catalog = std::move(catalog);
     impl_->slots = std::move(slots);
     impl_->magnifications = std::move(magnifications);
     impl_->initialized = true;
@@ -1531,16 +2171,19 @@ bool CursorEngine::Configure(const CursorAppearance& appearance, std::wstring& e
     error.clear();
     std::vector<CursorSlot> prepared;
     std::vector<MagnifiedArrow> magnifications;
+    CursorCatalog catalog;
+    catalog.factors = CursorDrawFactors();
     if (!impl_->initialized) {
         // Reload can fail because a previously selected file disappeared.
         // Rebuild the newly requested profile directly, not the stale one.
-        if (!CaptureOriginals(prepared, error)) return false;
+        if (!CaptureOriginals(prepared, catalog.factors, error)) return false;
     } else {
         prepared.reserve(impl_->slots.size());
         for (const auto& saved : impl_->slots) {
             CursorSlot slot;
             slot.id = saved.id; slot.shared = saved.shared; slot.previousShared = saved.previousShared;
-            slot.sourcePath = saved.sourcePath; slot.animated = saved.animated;
+            slot.sourcePath = saved.sourcePath;
+            slot.animated = saved.schemeRestore; slot.schemeRestore = saved.schemeRestore;
             // Configuration must never recapture an installed profile as the
             // user original. Clone only our original owned snapshot.
             slot.original = CopyOwnedCursor(saved.original);
@@ -1548,12 +2191,22 @@ bool CursorEngine::Configure(const CursorAppearance& appearance, std::wstring& e
                 error = WinError(L"Could not prepare the original cursor snapshot", GetLastError());
                 return false;
             }
+            slot.originalFile = saved.originalFile;
+            for (const HCURSOR image : saved.drawnImages) {
+                const HCURSOR copy = CopyOwnedCursor(image);
+                if (copy) slot.drawnImages.push_back(copy);
+            }
             prepared.push_back(std::move(slot));
         }
     }
-    if (!BuildArtwork(prepared, appearance, magnifications, error)) return false;
-    if (!Restore(error)) return false;
+    catalog.folder = impl_->cache.NewGeneration();
+    if (!BuildArtwork(prepared, appearance, magnifications, catalog, error) || !Restore(error)) {
+        RemoveCacheFolder(catalog.folder);
+        return false;
+    }
     for (auto& slot : prepared) RefreshSharedHandle(slot);
+    RemoveCacheFolder(impl_->catalog.folder);
+    impl_->catalog = std::move(catalog);
     impl_->slots = std::move(prepared);
     impl_->magnifications = std::move(magnifications);
     impl_->appearance = appearance;
@@ -1570,7 +2223,7 @@ bool CursorEngine::SetActive(bool active, std::wstring& error) {
     for (auto& slot : impl_->slots) {
         if (!slot.baselineChanged) continue;
         DWORD code = ERROR_SUCCESS;
-        if (!ApplySlot(slot, slot.released, code)) {
+        if (!ApplySlot(slot, slot.released, impl_->catalog, code)) {
             const std::wstring failure = WinError(L"Could not apply the released cursor profile", code);
             std::wstring restoreError;
             Restore(restoreError);
@@ -1589,7 +2242,7 @@ bool CursorEngine::SetPressed(bool pressed, std::wstring& error) {
     for (auto& slot : impl_->slots) {
         if (!slot.pressedApplied) continue;
         DWORD code = ERROR_SUCCESS;
-        if (!ApplySlot(slot, impl_->active ? impl_->Desired(slot) : slot.original, code)) {
+        if (!ApplySlot(slot, impl_->active ? impl_->Desired(slot) : slot.original, impl_->catalog, code)) {
             const std::wstring failure = WinError(L"Could not update the cursor appearance", code);
             std::wstring restoreError;
             Restore(restoreError);
@@ -1618,7 +2271,7 @@ bool CursorEngine::SetMagnification(float factor, std::wstring& error) {
     for (auto& slot : impl_->slots) {
         if (!slot.pressedApplied) continue;
         DWORD code = ERROR_SUCCESS;
-        if (!ApplySlot(slot, impl_->Desired(slot), code)) {
+        if (!ApplySlot(slot, impl_->Desired(slot), impl_->catalog, code)) {
             const std::wstring failure = WinError(L"Could not resize the locator cursor", code);
             std::wstring restoreError;
             Restore(restoreError);
@@ -1640,7 +2293,7 @@ bool CursorEngine::ApplyCurrent(std::wstring& error) {
     // Mark before the replacement so even an unusual partial API failure gets
     // a restoration attempt. Subsequent cursor events are idempotent.
     slot->pressedApplied = true;
-    if (!ApplySlot(*slot, impl_->Desired(*slot), code)) {
+    if (!ApplySlot(*slot, impl_->Desired(*slot), impl_->catalog, code)) {
         const std::wstring failure = WinError(L"Could not apply the cursor effect", code);
         std::wstring restoreError;
         Restore(restoreError);
@@ -1663,9 +2316,9 @@ bool CursorEngine::Restore(std::wstring& error) noexcept {
             if (!slot.touched) continue;
             // An animated role has no faithful snapshot; the scheme reload
             // below brings its animation back exactly as Windows loads it.
-            if (slot.animated) { animatedTouched = true; continue; }
+            if (slot.schemeRestore) { animatedTouched = true; continue; }
             DWORD code = ERROR_SUCCESS;
-            if (ReplaceSlot(slot, slot.original, code)) {
+            if (ReplaceSlot(slot, slot.original, impl_->catalog, code)) {
                 slot.touched = false;
                 slot.pressedApplied = false;
                 slot.applied = nullptr;
@@ -1708,6 +2361,8 @@ bool CursorEngine::Reload(std::wstring& error) {
     if (!Restore(error)) return false;
     impl_->slots.clear();
     impl_->magnifications.clear();
+    RemoveCacheFolder(impl_->catalog.folder);
+    impl_->catalog = {};
     impl_->initialized = false;
     return Initialize(error);
 }

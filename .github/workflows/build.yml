@@ -23,25 +23,11 @@ jobs:
         run: cmake -S . -B build -A x64 -DCLICKSHADE_BUILD_TESTS=ON
       - name: Compile
         run: cmake --build build --config Release --parallel
-      - name: Headless decoder and layout checks
-        shell: pwsh
-        run: |
-          & .\build\Release\ClickShadeAudioTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\Release\ClickShadeAudioStreamingTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\Release\ClickShadeSettingsProfileTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\Release\ClickShadeUiScaleTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\Release\ClickShadeShakeLocatorTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\Release\ClickShadeFramePacingTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\Release\ClickShadeHotkeysTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\build\Release\ClickShadeKeyDisplayTest.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # Every headless suite registered with add_test runs here, so a new test
+      # needs no edit to this file. The interactive cursor, runtime and visual
+      # suites stay unregistered.
+      - name: Headless decoder, settings and layout checks
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
       - name: Stage compiled files
         shell: pwsh
         run: |
@@ -71,7 +57,7 @@ jobs:
           cmake --build build-linux --parallel
       - name: Headless settings and extension logic checks
         run: |
-          ctest --test-dir build-linux --output-on-failure
+          ctest --test-dir build-linux --output-on-failure --no-tests=error
           node linux/gnome-extension/tests.mjs
           node --check linux/gnome-extension/extension.js
           sh -n linux/gnome-extension/install.sh

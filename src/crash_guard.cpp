@@ -218,7 +218,10 @@ void HandleFatal(const wchar_t* kind, const wchar_t* detail, EXCEPTION_POINTERS*
 
     SYSTEMTIME now{}; GetSystemTime(&now);
     wchar_t stem[MAX_PATH * 2]{}, reportPath[MAX_PATH * 2]{}, dumpPath[MAX_PATH * 2]{};
-    if (state.reportDirectory[0]) {
+    // The folder is created only now, so normal use leaves no empty folder.
+    const bool folderReady = state.reportDirectory[0] &&
+        (CreateDirectoryW(state.reportDirectory, nullptr) || GetLastError() == ERROR_ALREADY_EXISTS);
+    if (folderReady) {
         _snwprintf(stem, MAX_PATH * 2 - 1, L"%s\\clickshade-crash-%04u%02u%02u-%02u%02u%02u", state.reportDirectory,
                    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
         _snwprintf(reportPath, MAX_PATH * 2 - 1, L"%s.txt", stem);
@@ -226,6 +229,8 @@ void HandleFatal(const wchar_t* kind, const wchar_t* detail, EXCEPTION_POINTERS*
     }
     TextSink sink;
     if (reportPath[0]) sink.file = CreateFileW(reportPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // Never name a report that could not be written.
+    if (sink.file == INVALID_HANDLE_VALUE) reportPath[0] = dumpPath[0] = 0;
     wchar_t summary[512]{};
     DbgHelp dbg;
     sink.Format(L"ClickShade %s crash report", kClickShadeVersionW);
@@ -248,7 +253,7 @@ void HandleFatal(const wchar_t* kind, const wchar_t* detail, EXCEPTION_POINTERS*
         _snwprintf(summary, 511, L"%s%s%s", kind, detail && detail[0] ? L": " : L"", detail ? detail : L"");
     }
     summary[511] = 0;
-    sink.Line(L"This report contains no settings, selected file paths, screen contents or input.");
+    sink.Line(L"This report lists no settings or screen contents. A minidump, when written, holds thread stack memory.");
     WriteStack(sink, pointers ? pointers->ContextRecord : nullptr, dbg);
     if (sink.file != INVALID_HANDLE_VALUE) CloseHandle(sink.file);
     if (dumpPath[0] && dbg.miniDump) {
@@ -261,7 +266,7 @@ void HandleFatal(const wchar_t* kind, const wchar_t* detail, EXCEPTION_POINTERS*
             CloseHandle(dump);
         }
     }
-    if (state.reportDirectory[0]) {
+    if (folderReady) {
         wchar_t noticePath[MAX_PATH * 2];
         _snwprintf(noticePath, MAX_PATH * 2 - 1, L"%s\\%s", state.reportDirectory, kNoticeFile);
         TextSink notice;
@@ -303,7 +308,7 @@ void __cdecl OnInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, 
 void InstallCrashGuard(const CrashGuardOptions& options) {
     state.restart = options.restartAfterCrash;
     state.generation = options.restartGeneration;
-    const auto directory = CrashReportDirectory();
+    const auto directory = CrashReportPath();
     wcsncpy(state.reportDirectory, directory.c_str(), MAX_PATH * 2 - 1);
     const auto executable = ExecutablePath();
     wcsncpy(state.executable, executable.c_str(), MAX_PATH * 2 - 1);

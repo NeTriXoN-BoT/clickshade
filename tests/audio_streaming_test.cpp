@@ -73,10 +73,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lpa
 std::wstring TemporaryFolder() {
     wchar_t folder[MAX_PATH]{};
     GetTempPathW(MAX_PATH, folder);
-    const std::wstring path = std::wstring(folder) + L"ClickShade-audio-test-" + std::to_wstring(GetCurrentProcessId());
-    CreateDirectoryW(path.c_str(), nullptr);
-    return path;
+    return std::wstring(folder) + L"ClickShade-audio-test-" + std::to_wstring(GetCurrentProcessId());
 }
+// A fixture folder is removed when it goes out of scope. Declared before the
+// Sound fixtures, it is destroyed after them, once its files are gone.
+struct Folder {
+    std::wstring path;
+    explicit Folder(std::wstring value) : path(std::move(value)) { CreateDirectoryW(path.c_str(), nullptr); }
+    Folder(const Folder&) = delete;
+    Folder& operator=(const Folder&) = delete;
+    ~Folder() { RemoveDirectoryW(path.c_str()); }
+};
 struct Sound {
     std::wstring path;
     Sound(const std::wstring& file, std::int16_t amplitude, double seconds) : path(file) {
@@ -102,19 +109,18 @@ struct Sound {
 
 int wmain() {
     clickshade::audio_detail::deviceFactoryOverride = [] { return std::unique_ptr<clickshade::OutputDevice>(new FakeDevice()); };
-    const auto folder = TemporaryFolder();
-    const auto keyboardFolder = folder + L"\\mechanical";
-    CreateDirectoryW(keyboardFolder.c_str(), nullptr);
+    const Folder folder(TemporaryFolder());
+    const Folder keyboardFolder(folder.path + L"\\mechanical");
     // Amplitudes are chosen so sums and halves stay unique in the histogram.
-    Sound left(folder + L"\\left.wav", 6000, 12), right(folder + L"\\right.wav", 10000, 12), middle(folder + L"\\middle.wav", 14000, 12);
-    Sound keyA(keyboardFolder + L"\\key-1.wav", 1100, 0.05), keyB(keyboardFolder + L"\\key-2.wav", 1200, 0.05), space(keyboardFolder + L"\\space.wav", 1300, 0.05);
+    Sound left(folder.path + L"\\left.wav", 6000, 12), right(folder.path + L"\\right.wav", 10000, 12), middle(folder.path + L"\\middle.wav", 14000, 12);
+    Sound keyA(keyboardFolder.path + L"\\key-1.wav", 1100, 0.05), keyB(keyboardFolder.path + L"\\key-2.wav", 1200, 0.05), space(keyboardFolder.path + L"\\space.wav", 1300, 0.05);
     WNDCLASSW wc{}; wc.lpfnWndProc = WindowProc; wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"ClickShade.AudioStreamingTest"; RegisterClassW(&wc);
     HWND window = CreateWindowW(wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
     clickshade::Settings settings;
     settings.clickSoundsEnabled = true; settings.soundVolume = 100;
     settings.leftSoundPath = left.path; settings.rightSoundPath = right.path; settings.middleSoundPath = middle.path;
-    settings.keyboardSoundsEnabled = true; settings.keyboardVolume = 100; settings.keyboardSoundPath = keyboardFolder;
+    settings.keyboardSoundsEnabled = true; settings.keyboardVolume = 100; settings.keyboardSoundPath = keyboardFolder.path;
     clickshade::ClickAudio audio; audio.SetNotifyWindow(window, WM_APP + 17);
     std::wstring error;
     Check(audio.Start(settings, error) && Until([&] { return notifications != 0 && audio.Ready(); }), "worker prepares the three mouse sources and the keyboard set");
@@ -189,7 +195,6 @@ int wmain() {
     FakeDevice::failOpen = false;
 
     if (window) DestroyWindow(window);
-    for (const auto& path : {keyboardFolder, folder}) RemoveDirectoryW(path.c_str());
     std::printf("Results: %u passed, %u failed.\n", passed, failed);
     return failed ? 1 : 0;
 }

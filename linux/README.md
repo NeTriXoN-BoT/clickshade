@@ -29,7 +29,15 @@ Use **Quit** to stop the application and its effects.
 ./ClickShade --background  # Start in the tray or minimized taskbar window
 ./ClickShade --restore     # Pause and restore through the running instance
 ./ClickShade --quit        # Quit the running instance
+./ClickShade --version     # Print the version
 ```
+
+`--background` (used by the sign-in entry) and **Open settings minimized** never
+show the settings window. The app waits up to about 1.5 seconds for the system
+tray to take its icon and stays there; without a tray, the window opens
+minimized in the taskbar instead. A panel that starts slowly and takes the icon
+later still moves the minimized window into the tray, unless you opened the
+window meanwhile.
 
 Normal application uniqueness uses the desktop session D-Bus service. Run the
 program as your ordinary desktop user, not through sudo.
@@ -38,19 +46,19 @@ program as your ordinary desktop user, not through sudo.
 
 | Capability | Native X11 session | GNOME Wayland companion |
 | --- | --- | --- |
-| Pointer highlight in five styles (filled, ring, glow, crosshair, spotlight) with breathing and idle hide | Supported with a compositing window manager; the spotlight dims the pointer's monitor through one window that is redrawn only around the circle | Implemented by the bundled Shell extension; the spotlight is drawn as a glow |
+| Pointer highlight in five styles (filled, ring, glow, crosshair, spotlight) with breathing and idle hide | Supported with a compositing window manager; the spotlight dims the pointer's monitor through one window that is redrawn only around the circle. Breathing redraws about 30 times a second whatever the frame limit, in a window of fixed size | Implemented by the bundled Shell extension; the spotlight is drawn as a glow |
 | Left, right and middle click effects in six styles (ring, pulse, ripple, burst, neon, target) | Supported with a compositing window manager | Implemented by the bundled Shell extension |
-| Keyboard sounds (set folders with key variants, space, enter and backspace) | Raw key presses are subscribed only while the option is on and reduced to a coarse category | The extension forwards the same coarse category; sounds play in the app |
+| Keyboard sounds (set folders with key variants, space, enter and backspace) | Raw key presses are subscribed only while the option is on and reduced to a coarse category; they keep playing while an application hides the pointer | The extension forwards the same coarse category; sounds play in the app |
 | Optional Dots, Rings, Sparkles, Comet and Fine sparkle trails | Supported, bounded to 32 stamps; off by default | Not implemented |
 | Shake to find the pointer | Optional Plasma-style or macOS-inspired enlargement of cached native cursor pixels | Not implemented; use a compositor-provided locator |
-| Magnifier lens (zoom, size, shape, frame color or no frame) | A lens beside the pointer, read from the screen about 30 times a second with the current cursor drawn in; needs a 24/32-bit display | A square lens beside the pointer cloned from the window layer; the Shell's own chrome is not part of it |
+| Magnifier lens (zoom, size, shape, frame color or no frame) | A lens beside the pointer with the current cursor drawn in, read from the screen when the pointer moves and about 30 times a second at rest; needs a 24/32-bit display | A square lens beside the pointer cloned from the window layer; the Shell's own chrome is not part of it |
 | Key display (shortcuts only or every key, mouse buttons, position, size, hold time, colors) | Raw key presses and releases are subscribed only while the option is on; keycaps and typed words exist only while shown | Shell captured key events become St keycaps; same rules |
 | Animation rate | Auto adapts effect work within the monitor limit; manual 30–360 FPS | Auto follows compositor sampling; manual 30–360 Hz sampling cap |
 | Global shortcuts | Configurable X11 passive grabs | Not implemented |
 | Current pointer dark while pressed / brief flash | Temporary software inversion; system artwork is not permanently changed | Unavailable |
 | Cursor profile replacement, reverse mode, custom cursor files and cursor resizing | Unavailable; preferences retained in the UI | Unavailable; preferences retained in the UI |
 | Cursor look (opacity, soft shadow, fill and outline colors) | Unavailable (Windows only) | Unavailable (Windows only) |
-| Fullscreen, application exclusions and allowances | Supported according to desktop window properties | Supported through Shell window information |
+| Fullscreen pause for games, application exclusions and allowances | Only a fullscreen game pauses (see below); browsers, video players and presentations keep their effects | Supported through Shell window information, with comparable game rules (see the extension README) |
 | Generic pointer confinement detection | Unavailable | Unavailable |
 | Left, right and middle click sounds | PCM/float WAV streaming through a PulseAudio-compatible audio server | Same worker through the running native app and extension click notifications |
 | Other Wayland desktops | Never routed through Xwayland as if it offered global access | Unsupported; the settings window explains the limitation |
@@ -67,13 +75,16 @@ private cursor resource.
 Pressed-cursor inversion is software-rendered and follows compositor timing;
 it does not have the Windows edition's hardware-cursor presentation path.
 Inversion and shake enlargement are disabled when the server has multiple independent master pointers,
-because XFixes hiding would affect unrelated pointer sprites. Fully transparent
-cursor images pause effects, but X11 cannot reveal every application's pointer
-confinement or its separate XFixes cursor-hide requests. Keep fullscreen pause
-enabled and add explicit exclusions for windowed games.
+because XFixes hiding would affect unrelated pointer sprites. X11 cannot reveal
+every application's pointer confinement or its separate XFixes cursor-hide
+requests. Keep fullscreen pause enabled and add explicit exclusions for windowed
+games.
 
 The GNOME adapter is experimental. It must be installed and enabled separately;
-see [the extension instructions](gnome-extension/README.md). Pointer/button
+see [the extension instructions](gnome-extension/README.md). The extension shows
+nothing until this app is running and activates it, and its effects stop when the
+app quits, crashes or is killed. After an update, run its `install.sh` again and
+log out and back in so GNOME Shell loads the new code. Pointer/button
 sampling can miss a press shorter than one sampling interval. GNOME Shell and a
 Wayland compositor were not available in the build environment, so successful
 source and mock checks do not establish real GNOME runtime compatibility.
@@ -82,13 +93,45 @@ The active backend's capabilities and errors appear under
 **Appearance → This session**. Activity counters and diagnostic logging are not exposed. Unsupported cursor controls are disabled and
 explained, while their saved values are retained.
 
+### Hidden pointer and typing
+
+On X11, an application that shows a completely transparent cursor image (every
+pixel fully transparent, checked once per cursor shape) has hidden the pointer:
+Firefox does this for CSS `cursor: none`, such as an idle video player, and many
+editors do it while you type. Every pointer effect hides then, the spotlight and
+the magnifier included, and click sounds stop. Keyboard sounds and the key
+display keep working.
+
+Typing is the exception for the spotlight and the magnifier. When the pointer
+hides within about 1.5 seconds of a key press, they stay where they are, and the
+magnifier keeps showing live content, until the pointer shows again or about
+3 seconds pass without a key. Key presses are only observed while keyboard
+sounds or the key display are switched on; otherwise there is no typing hold.
+Only the time of the last press is kept.
+
+### Fullscreen games
+
+**Pause in fullscreen games** pauses effects only for a fullscreen game. On
+X11 a window counts as a game when its process (from `_NET_WM_PID`, read through
+`/proc/<pid>/exe` and `/proc/<pid>/cmdline`) runs from a Steam library
+(`steamapps/common`), is a Wine or Proton program (an `.exe` among its first
+arguments, `wine`, `wine64`, `wine-preloader` or `wine64-preloader`), runs under
+gamescope, or runs from a Heroic (`~/Games/Heroic`), Lutris
+(`~/.local/share/lutris`) or itch (`.itch/apps`, `itch/apps`, `itch-apps`) game
+folder, or when its `WM_CLASS` starts with `steam_app_`. Browsers, video players
+and presentations keep their effects in fullscreen. Excluded applications still
+pause and allowed applications still run. A game started some other way keeps
+its effects; add it to the exclusions instead. The GNOME extension applies
+comparable rules; see its README.
+
 ## Sound files
 
 Each mouse button has its own selected file, **Test**, **Clear**, and sound-library
 dropdown. The dropdown lists actual WAV files under the executable-relative
 `sounds/` folder: the original Soft, Glass, Wood, Tick, Bubble and Arcade sets plus
 the Classic, Mechanical, Pop, Laser and Retro sets, each with left/right/middle
-files. Add your own WAV files there and choose **Refresh list**.
+files. The `sounds/keyboard/` sets are left out, as on Windows; they have their
+own picker. Add your own WAV files there and choose **Refresh list**.
 
 **Keyboard sounds** have their own switch, volume and set picker. A set is a folder
 under `sounds/keyboard/` (Classic, Mechanical Blue, Mechanical Brown, Laptop and
@@ -107,8 +150,8 @@ turn on the sound master switch.
 Mono/stereo PCM or floating-point RIFF WAV at 8–192 kHz is supported. There is no
 application limit of ten seconds or ten MiB. A 100 ms initial prefix is decoded
 in advance; longer files stream through fixed read-ahead windows on the audio
-worker. Up to twelve voices overlap with bounded memory, and mouse and keyboard
-voices carry separate live volumes. RIFF's own 32-bit chunk
+worker. Up to twelve voices overlap with bounded memory (while all twelve play, a
+new sound is skipped), and mouse and keyboard voices carry separate live volumes. RIFF's own 32-bit chunk
 sizes still apply; RF64 and compressed formats are not implemented here.
 Volume edits affect subsequent mixed buffers of an active sound without
 restarting it; zero volume stops/flushes voices. Pause and Quit also flush them.
@@ -116,9 +159,12 @@ Ordinary regular-file I/O may still be delayed by a failing or remote filesystem
 Named pipes and devices are rejected before reading.
 
 The audio server may be PulseAudio or PipeWire's PulseAudio compatibility
-service. Missing audio support reports an error without disabling visual
-effects. Audible playback and physical output latency still need target-device
-verification.
+service. The playback stream is paused (corked) about 400 ms after the last
+sound ends, so the server can suspend the output device, and resumes with the
+next sound. With both click and keyboard sounds switched off, the app keeps no
+connection to the sound server; **Test** connects on demand. Missing audio
+support reports an error without disabling visual effects. Audible playback
+and physical output latency still need target-device verification.
 
 ## Shake and animation
 
@@ -134,16 +180,21 @@ changing acceleration.
 X11 magnifies cached pixels of the **actual current cursor**, preserving its
 aspect ratio, transparency, hotspot and click-time inversion. This differs from
 KWin's themed-arrow replacement. A bounded cache (up to 32 sizes, 24 MiB total)
-is rebuilt on cursor/configuration changes, not on each animation frame. An
-exceptionally large cursor that exceeds the cache bound remains native and a
-capability error is shown. The animation finishes and the worker has no idle
-render timer. GNOME Wayland shake/enlargement is explicitly unavailable in this
+is built when a shake starts, once per cursor shape, never for every shape the
+pointer takes while you browse and never on an animation frame. An
+exceptionally large cursor that exceeds the cache bound remains native and an
+error is shown when a shake is attempted. The animation finishes and the worker
+has no idle render timer. GNOME Wayland shake/enlargement is explicitly unavailable in this
 companion; it does not alter a global cursor-size setting as a substitute.
 
-**Highlights → Animation** offers Auto (adaptive) and a manual 30–360 FPS control.
+**Appearance → Frame pacing** offers Auto (adaptive) and a manual 30–360 FPS control.
 On X11, Auto observes only ClickShade's own drawing cost, reduces particle/trail
 work after sustained overload and recovers with headroom. The cached halo can
-continue following at the monitor limit. No benchmark, hardware inventory or
+continue following at the monitor limit. A breathing highlight keeps its own
+pace of about 30 redraws a second, and the magnifier reads the screen when the
+pointer moves (at most at the frame limit) or about 30 times a second at rest;
+the breathing pace and the resting lens refresh ignore the frame limit. No
+benchmark, hardware inventory or
 network request is performed. GNOME Auto is compositor-controlled sampling,
 not this X11/Windows workload policy. These are work/submission limits, not a
 promise of presented frame rates on every device.
@@ -152,7 +203,7 @@ promise of presented frame rates on every device.
 
 Effects use the current OS pointer position. Mouse acceleration can be enabled or disabled; ClickShade does not change acceleration, sensitivity, pointer speed or position. The X11 inverse cursor is a software overlay, so presentation follows the compositor even though the real pointer position is untouched.
 
-Fullscreen heuristics distinguish ordinary decorated/maximized windows. **Always allow in these apps** exempts explicitly selected desktop tools from fullscreen pause. Explicit exclusions, lock screens and transparent cursor images still take priority. Root window notifications repair stationary overlay order over newly opened popups; there is no idle redraw loop.
+Fullscreen heuristics distinguish ordinary decorated/maximized windows, and only a fullscreen game pauses. **Always allow in these apps** exempts explicitly selected applications from fullscreen pause. Explicit exclusions, lock screens and transparent cursor images still take priority. Moving or resizing the focused window is re-checked at most every 60 ms, so a window drag does not slow the effects. A change of the display scale (`Xft.dpi`) while the app runs resizes every effect at once. Root window notifications repair stationary overlay order over newly opened popups; there is no idle redraw loop.
 
 Shortcuts are optional. Restore/pause defaults to **Ctrl+Shift+F10** on X11, and the other eight actions (including **Toggle keyboard sounds**, **Toggle magnifier** and **Toggle key display**) start unassigned. In **Appearance → Keyboard shortcuts**, edit a chord and choose Apply; Clear unassigns it. Conflicts preserve the previous working bindings. Ctrl+Alt+function-key and Ctrl+Alt+Backspace server combinations are rejected. Wayland global shortcuts are visibly unavailable in this version.
 
@@ -164,23 +215,29 @@ The **Presenter** tab holds the magnifier lens and the key display. On X11 the
 lens always sits above and to the right of the pointer (flipping to stay on the
 monitor) because it is read from the screen with `XGetImage`, and a lens centered
 on the pointer would capture itself. It shows the last captured cursor image in
-place, refreshes about thirty times a second while visible, honors the round or
-rounded-square shape, zoom, size and frame color (or no frame), and follows the same pause
-rules as the highlight, except that it (like the spotlight) stays put while an
-editor shows a transparent cursor as you type. It needs a compositing manager and a 24- or 32-bit
-display; otherwise the session card reports why it is hidden.
+place, follows the pointer and refreshes about thirty times a second at rest,
+honors the round or rounded-square shape, zoom, size and frame color (or no
+frame), and follows the same pause rules as the highlight, except that it (like
+the spotlight) stays put during a typing hold (see
+[Hidden pointer and typing](#hidden-pointer-and-typing)). The area it reads
+never extends past the pointer's monitor: a large lens on a small or high-scale
+monitor shows a smaller part of it, magnified a little more than the chosen zoom,
+instead. It needs a compositing manager and a
+24- or 32-bit display; otherwise the session card reports why it is hidden.
 
 The key display subscribes to raw key presses and releases only while it (or
 keyboard sounds) is switched on. **Shortcuts only** shows chords with Ctrl, Alt or
 Super, function keys, Escape, Print and a tapped modifier as rows of keycaps on
 rounded panels; **Every key** also shows typing, joining characters into one row in
 the case you typed them (current layout with Shift, Caps Lock and AltGr), and
-Backspace edits that row. A shortcut repeated within a second adds a count, up to
+Backspace edits that row. A typed row wider than the screen keeps its newest
+characters behind an ellipsis, and the rows are measured again when the key display
+appears on a monitor of a different width, so they always fit. A shortcut repeated within a second adds a count, up to
 three rows stack towards the screen edge, and each fades on its own after the hold
 time. Rows live only while they are on screen; nothing is recorded. Unlike the other effects it keeps working
 while an application shows a fully transparent cursor, because editors do that
-while you type; excluded and fullscreen applications and the lock screen still
-pause it. On GNOME Wayland the companion extension provides both tools with the
+while you type; excluded applications, fullscreen games and the lock screen
+still pause it. On GNOME Wayland the companion extension provides both tools with the
 limits listed above.
 
 ## Settings
@@ -265,11 +322,19 @@ cmake --build build-linux-cmake -j
 ctest --test-dir build-linux-cmake --output-on-failure
 ```
 
+`cmake --install` places the launcher as
+`share/applications/io.clickshade.ClickShade.desktop`, the name of the
+application ID, so GNOME on Wayland matches the running window to it;
+`StartupWMClass=ClickShade` keeps the match on X11. The version shown in the
+header bar, `--help` and `--version` comes from `src/version.h`, like the
+Windows build.
+
 All test build paths need a `dbus-daemon` executable for the private mock-bus test.
 The CMake test build and the Python builder's `--test` option also need
-`libxtst-dev`. CMake builds `ClickShadeX11Test`,
+`libxtst-dev`; `build.sh --test` runs the shortcut-syntax test only when `xtst`
+is installed and says so otherwise. CMake builds `ClickShadeX11Test`,
 which requires a compositing X11 test desktop and an explicit `--run` argument.
-CTest runs seven headless targets: settings/profiles, streaming WAV/audio boundaries, shortcut syntax, portable layout geometry, adaptive frame pacing, shake detection/timing, and the native GNOME bridge against a private mock D-Bus service. No live GNOME Shell is contacted. The shipping GUI has no self-test or status-dump mode. The Python builder's
+CTest runs eight headless targets: settings/profiles, streaming WAV/audio boundaries, shortcut syntax, portable layout geometry, adaptive frame pacing, shake detection/timing, fullscreen game detection, and the native GNOME bridge against a private mock D-Bus service. `build.sh --test` and `tools/build_linux.py --test` run the same eight. No live GNOME Shell is contacted. The shipping GUI has no self-test or status-dump mode. The Python builder's
 `--test` option also builds `build-linux/x11_smoke` without executing it.
 
 The optional `tools/build_linux.py` offers the same native build plus
@@ -290,12 +355,13 @@ source rebuild**; copying newer runtime libraries into system directories is not
 the recommended way to run this binary. Rebuild from source on other
 distributions with an older ABI.
 
-`build-linux/settings_test` is a separate developer executable for settings parsing, persistence, bounds, UTF-8 paths, reset and startup rollback. The headless suites cover complete profile validation, Unicode persistence, long-file streaming and live gain, shortcut syntax, private-bus queue/lifecycle behavior, layout, frame pacing and shake timing. These test executables are not distributed in the normal application folder.
+`build-linux/settings_test` is a separate developer executable for settings parsing, persistence, bounds, UTF-8 paths, reset and startup rollback. The headless suites cover complete profile validation, Unicode persistence, long-file streaming and live gain, separate mouse and keyboard voice release, shortcut syntax, private-bus queue/lifecycle behavior, layout, frame pacing, shake timing and fullscreen game detection. These test executables are not distributed in the normal application folder.
 Interactive X11 checks require a disposable composited desktop (for example Xvfb
 with Openbox and Picom) and must be explicitly requested with `--run`. They can
 move the pointer and generate mouse events. They verify inverted overlay pixels,
-held/overlapping buttons, flash timing, ordinary app input delivery, fullscreen and
-exclusion rules, transparent-cursor and common screen-lock signals, audio-error
+held/overlapping buttons, flash timing, ordinary app input delivery, fullscreen
+pause for games only and exclusion rules, transparent-cursor and typing-hold
+behavior of the magnifier, common screen-lock signals, audio-error
 isolation, latest-position motion, bounded frames and idle wakes, restoration,
 restart, all five trail styles, adaptive/manual timing, both shake presets, scaled
 hotspot and click-time inversion during enlargement, stationary popup stacking and

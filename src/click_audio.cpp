@@ -17,6 +17,7 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -55,6 +56,10 @@ enum Request : unsigned {
     kRequestCount
 };
 enum class Group : unsigned { Mouse, Keyboard };
+constexpr Group RequestGroup(unsigned request) noexcept {
+    return request <= kRequestMiddle || (request >= kRequestPreviewLeft && request <= kRequestPreviewMiddle)
+        ? Group::Mouse : Group::Keyboard;
+}
 
 struct AudioOptions {
     bool mouseEnabled = false;
@@ -641,17 +646,21 @@ private:
     bool started_ = false, invalidated_ = false;
 };
 
-// Legacy fallback with four 20 ms buffers. Headers stay prepared for the
-// lifetime of the open device and are only released after waveOutReset.
+// Legacy fallback with eight 10 ms buffers. One buffer holds exactly one
+// mixing chunk, so WritableFrames promises only what Write can queue. Headers
+// stay prepared for the lifetime of the open device and are only released
+// after waveOutReset.
 class WaveOutDevice final : public OutputDevice {
 public:
-    static constexpr std::size_t kBufferFrames = kOutputRate / 50;
-    static constexpr unsigned kBuffers = 4;
+    static constexpr std::size_t kBufferFrames = kMixFrames;
+    static constexpr unsigned kBuffers = 8;
     ~WaveOutDevice() override { Close(); if (event_) CloseHandle(event_); }
     bool Open(std::wstring& error) override {
         Close();
         if (!event_) event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!event_) { error = L"Could not create the audio output event."; return false; }
+        if (!buffers_) buffers_.reset(new (std::nothrow) Buffers());
+        if (!buffers_) { error = L"Could not allocate the audio output buffers."; return false; }
         WAVEFORMATEX format{};
         format.wFormatTag = WAVE_FORMAT_PCM;
         format.nChannels = 2; format.nSamplesPerSec = kOutputRate;
@@ -659,52 +668,60 @@ public:
         format.nAvgBytesPerSec = kOutputRate * 4;
         const MMRESULT result = waveOutOpen(&device_, WAVE_MAPPER, &format, reinterpret_cast<DWORD_PTR>(event_), 0, CALLBACK_EVENT);
         if (result != MMSYSERR_NOERROR) { device_ = nullptr; error = WaveError(result); return false; }
-        for (auto& buffer : buffers_) {
+        bool usable = false;
+        for (auto& buffer : *buffers_) {
             buffer.header = {};
             buffer.header.lpData = reinterpret_cast<LPSTR>(buffer.samples.data());
             buffer.header.dwBufferLength = static_cast<DWORD>(buffer.samples.size() * sizeof(std::int16_t));
             if (waveOutPrepareHeader(device_, &buffer.header, sizeof(buffer.header)) == MMSYSERR_NOERROR) {
-                buffer.prepared = true;
+                buffer.prepared = usable = true;
                 buffer.header.dwFlags |= WHDR_DONE; // Free until the first write.
             }
         }
+        // Without one prepared buffer nothing could ever play; report it
+        // instead of keeping voices waiting on a device with no room.
+        if (!usable) { Close(); error = L"Could not prepare the audio output buffers."; return false; }
         return true;
     }
     void Close() noexcept override {
         if (!device_) return;
         waveOutReset(device_);
         bool retained = false;
-        for (auto& buffer : buffers_) {
+        for (auto& buffer : *buffers_) {
             if (buffer.prepared && waveOutUnprepareHeader(device_, &buffer.header, sizeof(buffer.header)) == MMSYSERR_NOERROR)
                 buffer.prepared = false;
             retained |= buffer.prepared;
         }
-        // A driver that refuses to release its headers keeps the handle alive
-        // until process exit instead of risking a use-after-free.
-        if (!retained && waveOutClose(device_) == MMSYSERR_NOERROR) device_ = nullptr;
-        else if (retained) device_ = nullptr;
+        // A driver that keeps its headers or its handle keeps them, the
+        // sample memory and the callback event until process exit. Freeing
+        // them would leave the driver writing to freed memory or signalling
+        // a handle value that may already be reused.
+        if (retained || waveOutClose(device_) != MMSYSERR_NOERROR) {
+            if (retained) static_cast<void>(buffers_.release());
+            event_ = nullptr;
+        }
+        device_ = nullptr;
     }
     bool Start(std::wstring&) override { return device_ != nullptr; }
     void Stop() noexcept override { if (device_) waveOutReset(device_); }
     HANDLE Event() const noexcept override { return event_; }
-    std::size_t WritableFrames() override {
-        std::size_t frames = 0;
-        for (const auto& buffer : buffers_)
-            if (buffer.prepared && (buffer.header.dwFlags & WHDR_DONE)) frames += kBufferFrames;
-        return frames;
-    }
+    std::size_t WritableFrames() override { return FreeBuffers() * kBufferFrames; }
     bool Write(const std::int16_t* interleaved, std::size_t frames, std::wstring& error) override {
+        // Each write needs whole buffers. Refusing up front never reports
+        // success for mixed audio that had nowhere to go.
+        if (!device_ || (frames + kBufferFrames - 1) / kBufferFrames > FreeBuffers()) {
+            error = L"The waveOut output had no free buffer for the mixed audio."; return false;
+        }
         std::size_t written = 0;
-        while (written < frames) {
-            Buffer* free = nullptr;
-            for (auto& buffer : buffers_) if (buffer.prepared && (buffer.header.dwFlags & WHDR_DONE)) { free = &buffer; break; }
-            if (!free) return true; // The caller only writes what WritableFrames allowed.
+        for (auto& buffer : *buffers_) {
+            if (written >= frames) break;
+            if (!Free(buffer)) continue;
             const std::size_t count = std::min(kBufferFrames, frames - written);
-            std::memcpy(free->samples.data(), interleaved + written * 2, count * 4);
-            free->header.dwBufferLength = static_cast<DWORD>(count * 4);
-            free->header.dwFlags &= ~WHDR_DONE;
-            const MMRESULT result = waveOutWrite(device_, &free->header, sizeof(free->header));
-            if (result != MMSYSERR_NOERROR) { free->header.dwFlags |= WHDR_DONE; error = WaveError(result); return false; }
+            std::memcpy(buffer.samples.data(), interleaved + written * 2, count * 4);
+            buffer.header.dwBufferLength = static_cast<DWORD>(count * 4);
+            buffer.header.dwFlags &= ~WHDR_DONE;
+            const MMRESULT result = waveOutWrite(device_, &buffer.header, sizeof(buffer.header));
+            if (result != MMSYSERR_NOERROR) { buffer.header.dwFlags |= WHDR_DONE; error = WaveError(result); return false; }
             written += count;
         }
         return true;
@@ -713,8 +730,18 @@ public:
     const wchar_t* Name() const noexcept override { return L"waveOut"; }
 private:
     struct Buffer { WAVEHDR header{}; std::array<std::int16_t, kBufferFrames * 2> samples{}; bool prepared = false; };
+    using Buffers = std::array<Buffer, kBuffers>;
+    static bool Free(const Buffer& buffer) noexcept { return buffer.prepared && (buffer.header.dwFlags & WHDR_DONE); }
+    // Only this thread clears WHDR_DONE, so the count can grow but never
+    // shrink between WritableFrames and Write.
+    std::size_t FreeBuffers() const noexcept {
+        std::size_t count = 0;
+        if (buffers_) for (const auto& buffer : *buffers_) count += Free(buffer);
+        return count;
+    }
     HWAVEOUT device_ = nullptr;
-    std::array<Buffer, kBuffers> buffers_;
+    // Heap storage so a driver that keeps its headers can be left the memory.
+    std::unique_ptr<Buffers> buffers_;
     HANDLE event_ = nullptr;
 };
 
@@ -729,6 +756,14 @@ struct Voice {
     std::size_t ringRead = 0, ringCount = 0;
     bool Active() const noexcept { return clip != nullptr; }
     void Reset() noexcept { clip.reset(); stream.reset(); source.count = 0; position = 0; ended = false; ringRead = ringCount = 0; }
+    // Frames still to be heard. A compressed stream reports no length until
+    // it ends, so it counts as the longest.
+    std::uint64_t Remaining() const noexcept {
+        if (ended) return ringCount;
+        if (clip->media && !clip->complete) return std::numeric_limits<std::uint64_t>::max();
+        return (clip->outputFrames > position ? clip->outputFrames - position : 0) + ringCount;
+    }
+    std::uint64_t Played() const noexcept { return position - ringCount; }
 };
 } // namespace
 
@@ -742,7 +777,8 @@ struct ClickAudio::Impl {
     std::atomic<HANDLE> wake{nullptr};
     std::atomic<bool> running{false};
     std::atomic<bool> stopping{false};
-    std::atomic<bool> allowed{true};
+    std::atomic<bool> allowed{true};          // Mouse sounds.
+    std::atomic<bool> keyboardAllowed{true};  // Keyboard sounds.
     std::atomic<bool> mouseEnabled{false};
     std::atomic<bool> keyboardEnabled{false};
     std::atomic<bool> loading{true};
@@ -760,6 +796,11 @@ struct ClickAudio::Impl {
     AudioOptions options;
     std::array<CachedClip, kSlotCount> cache;
     std::array<ClipPtr, kSlotCount> playback;
+    // Which slots hold their current sources (one bit per mouse slot). A
+    // switched-off group stays unloaded until a preview asks for it.
+    static constexpr unsigned kMouseSlots = (1u << kSlotLeft) | (1u << kSlotRight) | (1u << kSlotMiddle);
+    unsigned mouseLoaded = 0;
+    bool keyboardLoaded = false;
     unsigned keyVariantCount = 0;
     unsigned lastKeyVariant = 0;
     std::uint32_t randomState = 0x9e3779b9u;
@@ -809,6 +850,9 @@ struct ClickAudio::Impl {
                !counter.compare_exchange_weak(current, static_cast<std::uint8_t>(current + 1),
                                               std::memory_order_release, std::memory_order_relaxed)) {}
         Signal();
+    }
+    void ClearPending(Group group) noexcept {
+        for (unsigned i = 0; i < kRequestCount; ++i) if (RequestGroup(i) == group) pending[i].store(0);
     }
 
     // ---- Source loading (worker) ----
@@ -878,13 +922,9 @@ struct ClickAudio::Impl {
             if (playback[slot]) playback[write++] = playback[slot];
         keyVariantCount = write - kSlotKeyFirst;
         for (unsigned slot = write; slot <= kSlotKeyLast; ++slot) playback[slot].reset();
+        keyboardLoaded = true;
     }
-    void ReadOptions(MediaDecoder& decoder) {
-        AudioOptions next;
-        { std::lock_guard<std::mutex> lock(settingsMutex); next = pendingOptions; }
-        if ((options.mouseEnabled && !next.mouseEnabled) || next.mouseVolume == 0) StopGroup(Group::Mouse);
-        if ((options.keyboardEnabled && !next.keyboardEnabled) || next.keyboardVolume == 0) StopGroup(Group::Keyboard);
-        options = std::move(next);
+    void LoadMouseSet(MediaDecoder& decoder) {
         Load(cache[kSlotLeft], options.left, decoder);
         if (options.right == options.left) cache[kSlotRight] = cache[kSlotLeft];
         else Load(cache[kSlotRight], options.right, decoder);
@@ -892,8 +932,33 @@ struct ClickAudio::Impl {
         else if (options.middle == options.right) cache[kSlotMiddle] = cache[kSlotRight];
         else Load(cache[kSlotMiddle], options.middle, decoder);
         for (unsigned slot = kSlotLeft; slot <= kSlotMiddle; ++slot) playback[slot] = cache[slot].original;
+        mouseLoaded = kMouseSlots;
+    }
+    // Opens just the tested file of a switched-off mouse group.
+    void LoadMouseSlot(unsigned slot, MediaDecoder& decoder) {
+        const std::wstring& path = slot == kSlotLeft ? options.left : slot == kSlotRight ? options.right : options.middle;
+        Load(cache[slot], path, decoder);
+        playback[slot] = cache[slot].original;
+        mouseLoaded |= 1u << slot;
+    }
+    // Closes the group's files; voices already playing keep their own clip.
+    void ReleaseSlots(unsigned first, unsigned last) {
+        for (unsigned slot = first; slot <= last; ++slot) { cache[slot] = {}; playback[slot].reset(); }
+    }
+    void ReadOptions(MediaDecoder& decoder) {
+        AudioOptions next;
+        { std::lock_guard<std::mutex> lock(settingsMutex); next = pendingOptions; }
+        if ((options.mouseEnabled && !next.mouseEnabled) || next.mouseVolume == 0) StopGroup(Group::Mouse);
+        if ((options.keyboardEnabled && !next.keyboardEnabled) || next.keyboardVolume == 0) StopGroup(Group::Keyboard);
+        options = std::move(next);
+        // A switched-off group's paths are not touched, so a stale or
+        // imported path (a network share, say) is not opened until its
+        // sounds are switched on, which reloads, or its Test button asks.
+        if (options.mouseEnabled) LoadMouseSet(decoder);
+        else { ReleaseSlots(kSlotLeft, kSlotMiddle); mouseLoaded = 0; }
         if (stopping.load()) return;
-        LoadKeyboardSet(decoder);
+        if (options.keyboardEnabled) LoadKeyboardSet(decoder);
+        else { ReleaseSlots(kSlotKeyFirst, kSlotCount - 1); keyVariantCount = 0; keyboardError.clear(); keyboardLoaded = false; }
         if (stopping.load()) return;
         if (!settingsDirty.load()) loading.store(false);
         PublishError();
@@ -944,10 +1009,15 @@ struct ClickAudio::Impl {
         Voice* selected = nullptr;
         for (auto& voice : voices) if (!voice->Active()) { selected = voice.get(); break; }
         if (!selected) {
-            // Bounded overlap: replace the voice closest to its end rather
-            // than queueing an unbounded backlog.
-            for (auto& voice : voices)
-                if (!selected || voice->position > selected->position) selected = voice.get();
+            // Bounded overlap: replace the voice closest to its end (fewest
+            // frames left to hear) rather than queueing an unbounded backlog.
+            // Ties, including streams of unknown length, cut the one that
+            // has played longest.
+            for (auto& voice : voices) {
+                if (!selected) { selected = voice.get(); continue; }
+                const auto remaining = voice->Remaining(), best = selected->Remaining();
+                if (remaining < best || (remaining == best && voice->Played() > selected->Played())) selected = voice.get();
+            }
         }
         selected->Reset();
         selected->clip = clip;
@@ -1035,7 +1105,17 @@ struct ClickAudio::Impl {
         bool any = false;
         for (unsigned i = 0; i < kRequestCount; ++i) { counts[i] = pending[i].exchange(0, std::memory_order_acquire); any |= counts[i] != 0; }
         if (!any) return;
-        if (!allowed.load()) { StopVoices(); return; }
+        // Requests of a gated group are dropped with its voices; the other
+        // group keeps playing.
+        const bool mouseGate = allowed.load(), keyboardGate = keyboardAllowed.load();
+        if (!mouseGate) StopGroup(Group::Mouse);
+        if (!keyboardGate) StopGroup(Group::Keyboard);
+        if (!mouseGate && !keyboardGate) return;
+        // A switched-off group's files are opened only when its Test asks.
+        for (unsigned slot = kSlotLeft; slot <= kSlotMiddle && mouseGate; ++slot)
+            if (!(mouseLoaded & (1u << slot)) && counts[kRequestPreviewLeft + slot] && !stopping.load()) LoadMouseSlot(slot, decoder);
+        if (keyboardGate && !keyboardLoaded && counts[kRequestPreviewKey] && !stopping.load()) LoadKeyboardSet(decoder);
+        if (stopping.load()) return;
         const auto keyClip = [&]() -> ClipPtr {
             if (!keyVariantCount) return {};
             if (keyVariantCount == 1) return playback[kSlotKeyFirst];
@@ -1049,10 +1129,13 @@ struct ClickAudio::Impl {
         const auto categoryClip = [&](Slot special) { return playback[special] ? playback[special] : keyClip(); };
         unsigned maximum = 0;
         for (const auto count : counts) maximum = std::max<unsigned>(maximum, count);
-        for (unsigned round = 0; round < maximum && allowed.load(); ++round) {
+        for (unsigned round = 0; round < maximum; ++round) {
             const auto take = [&](Request request) { return counts[request] > round; };
-            const bool mouse = mouseEnabled.load() && !loading.load();
-            const bool keyboard = keyboardEnabled.load() && !loading.load();
+            // Re-read per round so a gate that closes mid-batch takes effect.
+            const bool mouseAllowed = allowed.load(), keysAllowed = keyboardAllowed.load();
+            if (!mouseAllowed && !keysAllowed) break;
+            const bool mouse = mouseAllowed && mouseEnabled.load() && !loading.load();
+            const bool keyboard = keysAllowed && keyboardEnabled.load() && !loading.load();
             if (mouse && take(kRequestLeft)) StartVoice(playback[kSlotLeft], Group::Mouse, decoder);
             if (mouse && take(kRequestRight)) StartVoice(playback[kSlotRight], Group::Mouse, decoder);
             if (mouse && take(kRequestMiddle)) StartVoice(playback[kSlotMiddle], Group::Mouse, decoder);
@@ -1060,10 +1143,10 @@ struct ClickAudio::Impl {
             if (keyboard && take(kRequestSpace)) StartVoice(categoryClip(kSlotSpace), Group::Keyboard, decoder);
             if (keyboard && take(kRequestEnter)) StartVoice(categoryClip(kSlotEnter), Group::Keyboard, decoder);
             if (keyboard && take(kRequestBackspace)) StartVoice(categoryClip(kSlotBackspace), Group::Keyboard, decoder);
-            if (take(kRequestPreviewLeft)) StartVoice(playback[kSlotLeft], Group::Mouse, decoder);
-            if (take(kRequestPreviewRight)) StartVoice(playback[kSlotRight], Group::Mouse, decoder);
-            if (take(kRequestPreviewMiddle)) StartVoice(playback[kSlotMiddle], Group::Mouse, decoder);
-            if (take(kRequestPreviewKey)) StartVoice(keyClip(), Group::Keyboard, decoder);
+            if (mouseAllowed && take(kRequestPreviewLeft)) StartVoice(playback[kSlotLeft], Group::Mouse, decoder);
+            if (mouseAllowed && take(kRequestPreviewRight)) StartVoice(playback[kSlotRight], Group::Mouse, decoder);
+            if (mouseAllowed && take(kRequestPreviewMiddle)) StartVoice(playback[kSlotMiddle], Group::Mouse, decoder);
+            if (keysAllowed && take(kRequestPreviewKey)) StartVoice(keyClip(), Group::Keyboard, decoder);
         }
     }
     // Moves mixed audio into the device while it has room, then refills rings.
@@ -1107,7 +1190,8 @@ struct ClickAudio::Impl {
             MediaDecoder decoder;
             try {
                 while (!stopping.load()) {
-                    if (!allowed.load()) StopVoices();
+                    if (!allowed.load()) StopGroup(Group::Mouse);
+                    if (!keyboardAllowed.load()) StopGroup(Group::Keyboard);
                     if (settingsDirty.exchange(false)) ReadOptions(decoder);
                     if (stopping.load()) break;
                     if (settingsDirty.load()) continue;
@@ -1135,6 +1219,9 @@ struct ClickAudio::Impl {
             CloseDevice();
             playback = {};
             for (auto& entry : cache) entry = {};
+            mouseLoaded = 0;
+            keyboardLoaded = false;
+            keyVariantCount = 0;
         }
         if (SUCCEEDED(com)) CoUninitialize();
         running.store(false);
@@ -1201,7 +1288,13 @@ void ClickAudio::UpdateSettings(const Settings& settings) {
 
 void ClickAudio::SetAllowed(bool allowed) noexcept {
     impl_->allowed.store(allowed);
-    if (!allowed) for (auto& counter : impl_->pending) counter.store(0);
+    if (!allowed) impl_->ClearPending(Group::Mouse);
+    impl_->Signal();
+}
+
+void ClickAudio::SetKeyboardAllowed(bool allowed) noexcept {
+    impl_->keyboardAllowed.store(allowed);
+    if (!allowed) impl_->ClearPending(Group::Keyboard);
     impl_->Signal();
 }
 
@@ -1213,7 +1306,7 @@ void ClickAudio::Click(unsigned mask) noexcept {
 }
 
 void ClickAudio::Key(unsigned category) noexcept {
-    if (!impl_->running.load() || !impl_->allowed.load() || !impl_->keyboardEnabled.load() || impl_->loading.load()) return;
+    if (!impl_->running.load() || !impl_->keyboardAllowed.load() || !impl_->keyboardEnabled.load() || impl_->loading.load()) return;
     switch (category) {
     case kKeySpace: impl_->Enqueue(kRequestSpace); break;
     case kKeyEnter: impl_->Enqueue(kRequestEnter); break;
@@ -1230,7 +1323,7 @@ void ClickAudio::Preview(unsigned mask) noexcept {
 }
 
 void ClickAudio::PreviewKey() noexcept {
-    if (!impl_->running.load() || !impl_->allowed.load()) return;
+    if (!impl_->running.load() || !impl_->keyboardAllowed.load()) return;
     impl_->Enqueue(kRequestPreviewKey);
 }
 

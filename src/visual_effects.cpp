@@ -1,6 +1,8 @@
 #include "visual_effects.h"
 #include "frame_pacing.h"
 #include "key_display.h"
+#include "pointer_lead.h"
+#include "pointer_visibility.h"
 #include "win_event_listener.h"
 
 #include <algorithm>
@@ -43,6 +45,14 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kBreathPeriodSeconds = 3.2;
 constexpr int kKeyFadeMs = 350;
 constexpr unsigned kLensIdleRate = 30; // Live lens redraws per second while the pointer rests.
+// Input this soon before the pointer disappears, with no pointer motion
+// since, means typing; the hold then lasts until this long after the last input.
+constexpr LONGLONG kTypingWindowMs = 1500;
+constexpr LONGLONG kTypingHoldMs = 3000;
+// The stacking hook stays this long after the last overlay hides, so a
+// burst of clicks or keystrokes does not restart it every time.
+constexpr UINT_PTR kStackLingerTimer = 1;
+constexpr UINT kStackLingerMs = 5000;
 // Magnification API values (magnification.h is not included: the API is
 // loaded at run time so machines without it keep every other effect).
 constexpr DWORD kMagnifierShowCursor = 0x0001;
@@ -172,11 +182,11 @@ std::wstring Failure(const wchar_t* operation, DWORD code) {
     return std::wstring(operation) + L" (Windows error " + std::to_wstring(code) + L").";
 }
 
+// A transparent cursor (Firefox for CSS cursor:none) counts as hidden too.
 bool VisibleCursor(POINT& point) noexcept {
     CURSORINFO info{};
     info.cbSize = sizeof(info);
-    if (!GetCursorInfo(&info) || !(info.flags & CURSOR_SHOWING) ||
-        (info.flags & CURSOR_SUPPRESSED) || !info.hCursor) return false;
+    if (!GetCursorInfo(&info) || !PointerVisible(info)) return false;
     point = info.ptScreenPos;
     return true;
 }
@@ -806,6 +816,19 @@ struct Surface {
         return true;
     }
 
+    // Changes only the constant opacity of pixels the compositor already
+    // holds: no source DC and no size, so nothing is copied again.
+    bool Fade(BYTE fade, std::wstring& error) {
+        if (fade == lastFade) return true;
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, fade, AC_SRC_ALPHA};
+        if (!UpdateLayeredWindow(window, nullptr, nullptr, nullptr, nullptr, nullptr, 0, &blend, ULW_ALPHA)) {
+            error = Failure(L"Windows could not fade a pointer effect", GetLastError());
+            return false;
+        }
+        lastFade = fade;
+        return true;
+    }
+
     // Records a placement performed by an external DeferWindowPos batch.
     void Placed(POINT origin) noexcept {
         visible = true;
@@ -817,15 +840,26 @@ struct Surface {
     bool Move(POINT center, std::wstring& error, bool raise = false) {
         if (visible && positioned && lastCenter.x == center.x &&
             lastCenter.y == center.y && !raise) return true;
+        POINT origin{center.x - width / 2, center.y - height / 2};
+        // A shown window moves through the layered-window update, the same
+        // call that moves the spotlight's circle. The compositor applies it
+        // one frame sooner than a SetWindowPos move. Showing and raising still
+        // use SetWindowPos, which is also the fallback.
+        if (visible && positioned && !raise) {
+            BLENDFUNCTION blend{AC_SRC_OVER, 0, lastFade, AC_SRC_ALPHA};
+            if (UpdateLayeredWindow(window, nullptr, &origin, nullptr, nullptr, nullptr, 0, &blend, ULW_ALPHA)) {
+                Placed(origin);
+                return true;
+            }
+        }
         const UINT flags = SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
             (visible ? 0u : SWP_SHOWWINDOW) | (raise ? 0u : SWP_NOZORDER);
-        if (!SetWindowPos(window, HWND_TOPMOST, center.x - width / 2,
-                           center.y - height / 2, 0, 0, flags)) {
+        if (!SetWindowPos(window, HWND_TOPMOST, origin.x, origin.y, 0, 0, flags)) {
             const DWORD code = GetLastError();
             error = Failure(L"Windows could not move the cursor highlight", code);
             return false;
         }
-        Placed({center.x - width / 2, center.y - height / 2});
+        Placed(origin);
         return true;
     }
 };
@@ -1055,7 +1089,6 @@ struct Lens {
     bool visible = false;
     bool framePresented = false;
     POINT lastCenter{};
-    RECT lastSource{};
     std::vector<HWND> filtered;
 
     Lens() = default;
@@ -1184,7 +1217,6 @@ struct Lens {
         }
         visible = true;
         lastCenter = center;
-        lastSource = source;
         return true;
     }
 
@@ -1223,6 +1255,7 @@ struct KeyStroke {
     std::wstring typed;
     unsigned repeat = 1;
     LONGLONG updated = 0; // Last change; the hold time starts here.
+    bool preview = false; // A "Show a sample" row, which the switch does not remove.
     // The row at full opacity, premultiplied, shadow margin included.
     std::vector<std::uint32_t> pixels;
     int width = 0, height = 0;
@@ -1271,7 +1304,6 @@ struct KeyPanel {
     HFONT capFont = nullptr, typeFont = nullptr, countFont = nullptr;
     KeyMetrics metrics;
     std::vector<KeyStroke> strokes; // Oldest first.
-    POINT origin{};
     bool visible = false;
 
     KeyPanel() = default;
@@ -1385,6 +1417,9 @@ struct KeyPanel {
 
     // Renders one row at full opacity into its own pixel buffer.
     bool RenderStroke(KeyStroke& stroke, const Config& config, int maximumWidth, std::wstring& error) {
+        // Measuring needs the text DC; the very first row would otherwise
+        // measure with none and get zero-width keycaps.
+        if (!EnsureText(1, 1, error)) return false;
         const KeyMetrics& m = metrics;
         const std::wstring count = stroke.repeat > 1 ? L"×" + std::to_wstring(stroke.repeat) : std::wstring();
         const int countWidth = count.empty() ? 0 : Measure(countFont, count).cx + m.capGap * 2;
@@ -1551,7 +1586,6 @@ struct KeyPanel {
 
     bool Present(POINT topLeft, std::wstring& error, bool raise = false) {
         if (!surface.PresentAt(topLeft, 255, error, raise)) return false;
-        origin = topLeft;
         visible = true;
         return true;
     }
@@ -1587,8 +1621,13 @@ struct QueuedClick {
     LONGLONG started = 0;
 };
 
+// Room beyond the click radius. Neon glows past it; Target starts at the full
+// radius, Ripple ends there and Burst's rays reach it, each with half its
+// line width outside the radius.
 int ParticlePadding(int style, int thicknessPixels) noexcept {
-    return style == kClickNeon ? std::max(4, thicknessPixels * 3) + 2 : 0;
+    if (style == kClickNeon) return std::max(4, thicknessPixels * 3) + 2;
+    if (style == kClickTarget || style == kClickRipple || style == kClickBurst) return (thicknessPixels + 1) / 2 + 1;
+    return 0;
 }
 
 }  // namespace
@@ -1606,6 +1645,9 @@ struct VisualEffects::Impl {
     std::atomic<bool> keyRequested{false};
     std::atomic<unsigned> clickButtons{0};
     std::atomic<bool> pointerDirty{false};
+    std::atomic<DWORD> lastMouseInputTick{0}; // GetTickCount() of the newest mouse input (see MouseInput).
+    std::atomic<bool> holdActive{false};      // A typing hold is on: mouse input re-checks it at once.
+    std::atomic<bool> holdKickPending{false};
     std::atomic<bool> pointerScheduled{false};
     std::atomic<bool> settingsQueued{false};
     std::atomic<bool> allowedQueued{false};
@@ -1618,7 +1660,6 @@ struct VisualEffects::Impl {
     std::atomic<std::uint64_t> frameCount{0};
     std::atomic<std::uint64_t> highlightMoves{0};
     std::atomic<std::uint64_t> highlightRasterizations{0};
-    std::atomic<std::uint64_t> clickFrames{0};
     std::atomic<std::uint64_t> pointerWakeups{0};
     std::atomic<std::uint64_t> stackWakeups{0};
     std::atomic<std::uint64_t> magnifierUpdates{0};
@@ -1676,6 +1717,8 @@ struct VisualEffects::Impl {
     unsigned monitorDpi = 96;
     HMODULE shcore = nullptr;
     WinEventListener stackListener;
+    bool stackListening = false; // The stacking hook is installed (see WatchStacking).
+    bool stackLingerArmed = false;
     bool stackDirty = false;
     using DpiFunction = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
     DpiFunction getDpiForMonitor = nullptr;
@@ -1684,15 +1727,34 @@ struct VisualEffects::Impl {
     bool lensUnavailable = false; // Set after a Magnification API failure until settings change.
     LONGLONG nextLensFrame = 0;
     POINT lensPointer{}; // Pointer position the lens was last placed for.
+    // Pointer lead (see LeadPoint and pointer_lead.h): the offset the halo,
+    // spotlight and lens were last drawn with, and when it expires if the
+    // pointer brings no new position.
+    PointerLead lead;
+    POINT leadOffset{};
+    bool leadApplied = false;
+    LONGLONG leadSettle = 0;
     KeyPanel keyPanel;
     LONGLONG nextKeyFrame = 0;
+    // Typing hold (see PointerHidden). Ticks are GetTickCount() values, the
+    // clock GetLastInputInfo reports in.
+    bool motionSeen = false;
+    DWORD lastMotionTick = 0; // Last pointer motion this renderer saw.
+    POINT seenPoint{};
+    bool pointerGone = false; // Hidden since the renderer last saw it.
+    bool typingHold = false;
+    bool holdLocated = false;
+    POINT holdPoint{}; // Where the hidden pointer was when the hold began.
+    LONGLONG holdUntil = 0;
 
     static void StackEvent(void* context, DWORD event, HWND window,
                            LONG object, LONG child, DWORD) noexcept {
         auto* self = static_cast<Impl*>(context);
         const bool menu = event >= EVENT_SYSTEM_MENUSTART && event <= EVENT_SYSTEM_MENUPOPUPEND;
         const bool reorder = event == EVENT_OBJECT_REORDER;
-        if (!self->accepting.load() || !self->allowed.load() || !self->renderHealthy.load() ||
+        // keyAllowed, not allowed: the key display, and a spotlight or lens
+        // held while typing, stay on screen while a hidden pointer pauses the rest.
+        if (!self->accepting.load() || !self->keyAllowed.load() || !self->renderHealthy.load() ||
             !self->stackWatching.load() || self->stackQueued.load() ||
             (!menu && !reorder && child != CHILDID_SELF))
             return;
@@ -1806,6 +1868,9 @@ struct VisualEffects::Impl {
         if (changed) {
             nextMotionFrame = nextAnimationFrame = lastAnimationFrame = 0;
         }
+        // Another monitor or rate: the motion history no longer applies.
+        lead.Configure(1.0 / motionRate, std::max(1u, monitorDpi) / 96.0);
+        ResetLead();
         if (previousDpi != dpi || previousRate != rate) Notify();
     }
 
@@ -1872,17 +1937,122 @@ struct VisualEffects::Impl {
         ClearParticles();
         ClearTrail();
         idleHidden = false;
+        typingHold = false;
+        holdActive.store(false, std::memory_order_relaxed);
         nextMotionFrame = lastAnimationFrame = nextAnimationFrame = nextBreathFrame = 0;
+        ResetLead();
         pacer.Observe(0.0, 0.0, false);
     }
 
+    void PointerMoved() noexcept {
+        motionSeen = true;
+        lastMotionTick = GetTickCount();
+    }
+
+    void ResetLead() noexcept {
+        lead.Reset();
+        leadOffset = {};
+        leadApplied = false;
+        leadSettle = 0;
+    }
+
+    double Seconds(LONGLONG counter) const noexcept { return static_cast<double>(counter) / static_cast<double>(frequency); }
+
+    void TakeLead(PointerLead::Offset offset) noexcept {
+        leadOffset = {static_cast<LONG>(std::lround(offset.x)), static_cast<LONG>(std::lround(offset.y))};
+        leadApplied = lead.Active();
+        leadSettle = leadApplied ? static_cast<LONGLONG>(std::ceil(lead.SettleTime() * static_cast<double>(frequency))) : 0;
+    }
+
+    // The halo, spotlight and lens reach the screen with the next
+    // composition, a few milliseconds after the pointer was read, and the
+    // pointer has moved on by then. During steady fast motion they are drawn
+    // where the pointer is heading (see pointer_lead.h): never for slow,
+    // braking or turning motion, and dropped as soon as the pointer stops,
+    // so the effects come to rest exactly on it. Trails and click effects
+    // always use the real positions.
+    POINT LeadPoint(POINT point, LONGLONG now) noexcept {
+        TakeLead(lead.Update(Seconds(now), point.x, point.y));
+        return LeadApplied(point);
+    }
+
+    // A frame without new motion once the lead's grace has passed.
+    POINT SettleLead(POINT point, LONGLONG now) noexcept {
+        lead.Settle(Seconds(now));
+        TakeLead(lead.Current());
+        // Never re-arm in the past: the lead ends on the next check at most.
+        if (leadApplied && leadSettle <= now) leadSettle = now + 1;
+        return LeadApplied(point);
+    }
+
+    // The point with the lead last computed, kept inside the pointer's monitor.
+    POINT LeadApplied(POINT point) const noexcept {
+        if (!leadApplied) return point;
+        const RECT& monitor = currentMonitorRect;
+        return {std::clamp<LONG>(point.x + leadOffset.x, monitor.left, std::max(monitor.left, monitor.right - 1)),
+                std::clamp<LONG>(point.y + leadOffset.y, monitor.top, std::max(monitor.top, monitor.bottom - 1))};
+    }
+
+    // The renderer's own view of a visible pointer. Seeing it ends a typing
+    // hold, and a changed position counts as pointer motion.
+    bool SamplePointer(POINT& point) noexcept {
+        if (!VisibleCursor(point)) return false;
+        if (!motionSeen || point.x != seenPoint.x || point.y != seenPoint.y) PointerMoved();
+        seenPoint = point;
+        pointerGone = typingHold = false;
+        holdActive.store(false, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Typing, as far as Windows tells: GetLastInputInfo reveals only the time
+    // of the newest input of any kind, never what it was. That input must be
+    // newer than the last pointer motion this renderer saw and come shortly
+    // before the pointer disappeared. A video player that hides an idle
+    // pointer fails both tests. The hold then lasts while input continues
+    // and the hidden pointer stays where it was.
+    void UpdateTypingHold() noexcept {
+        LASTINPUTINFO input{};
+        input.cbSize = sizeof(input);
+        const bool known = GetLastInputInfo(&input) != FALSE;
+        const DWORD tick = GetTickCount();
+        const DWORD inputAge = tick - input.dwTime;
+        POINT position{};
+        const bool located = GetCursorPos(&position) != FALSE;
+        const bool holding = spotlight.visible || lens.visible;
+        // Windows reports only the time of the newest input. When the runtime
+        // saw mouse input at or after that time, the newest input was the
+        // mouse (a click, scrolling, a game's mouse look), not typing.
+        const DWORD mouseTick = lastMouseInputTick.load(std::memory_order_relaxed);
+        const bool typedLast = known && (!mouseTick || static_cast<LONG>(input.dwTime - mouseTick) > 0);
+        if (!pointerGone) {
+            pointerGone = true;
+            holdLocated = located;
+            holdPoint = position;
+            // Not where it was last seen: it moved (a touch tap, a game), so
+            // the newest input is pointer motion after all.
+            const bool moved = located && motionSeen && (position.x != seenPoint.x || position.y != seenPoint.y);
+            typingHold = holding && typedLast && !moved && inputAge <= kTypingWindowMs &&
+                         (!motionSeen || inputAge < tick - lastMotionTick);
+        } else if (typingHold) {
+            // A hidden pointer that moves is in use, not waiting for typing to end.
+            const bool moved = located && holdLocated && (position.x != holdPoint.x || position.y != holdPoint.y);
+            typingHold = holding && typedLast && inputAge < kTypingHoldMs && !moved;
+        }
+        if (typingHold)
+            holdUntil = CounterNow() + frequency * std::max<LONGLONG>(20, kTypingHoldMs - inputAge) / 1000;
+        holdActive.store(typingHold, std::memory_order_relaxed);
+    }
+
     // The pointer is hidden or suppressed while the effects are otherwise
-    // allowed. Editors hide it while you type, so the spotlight and the lens
-    // stay where they are: a dimmed screen that flashes on and off with every
-    // keystroke is worse than a spotlight that waits. What is drawn at the
-    // pointer itself (halo, trail, click rings) hides with it.
+    // allowed. Everything drawn for the pointer hides with it, so a video
+    // that hides an idle pointer leaves no dimmed screen or lens behind.
+    // Editors hide it while you type, though, and a spotlight or lens that
+    // flashed with every word would be worse than one that waits: during a
+    // typing hold those two stay where they are.
     void PointerHidden() noexcept {
         if (!MayShowKeys()) { HidePointer(); return; }
+        UpdateTypingHold();
+        if (!typingHold) { HidePointer(); return; }
         highlight.Hide();
         if (!SpotlightWanted() || idleHidden) spotlight.Hide();
         if (!LensWanted()) HideLens();
@@ -1891,23 +2061,62 @@ struct VisualEffects::Impl {
         ClearParticles();
         ClearTrail();
         nextMotionFrame = lastAnimationFrame = nextAnimationFrame = nextBreathFrame = 0;
+        ResetLead();
         pacer.Observe(0.0, 0.0, false);
     }
 
     // A held lens keeps showing live content at the idle rate.
     bool RefreshHeldLens(LONGLONG now) {
-        if (!lens.visible || !nextLensFrame || now < nextLensFrame) return true;
+        if (!typingHold || !lens.visible || !nextLensFrame || now < nextLensFrame) return true;
         return RenderLens(lensPointer, false, true);
     }
 
     // Repaints a held spotlight whose settings changed while the pointer was hidden.
     bool RefreshHeldSpotlight() {
-        if (!spotlight.visible || !SpotlightWanted() || highlightPixelsReady) return true;
+        if (!typingHold || !spotlight.visible || !SpotlightWanted() || highlightPixelsReady) return true;
         return RenderSpotlight(spotlight.lastPoint, false);
     }
 
-    void HideAll() noexcept {
+    void StopStackListener() noexcept {
+        if (stackLingerArmed) KillTimer(controller.load(), kStackLingerTimer);
+        stackLingerArmed = false;
+        stackListener.Stop();
+        stackListening = false;
+    }
+
+    void UnwatchStacking() noexcept {
         stackWatching.store(false);
+        if (!stackListening || stackLingerArmed) return;
+        stackLingerArmed = SetTimer(controller.load(), kStackLingerTimer, kStackLingerMs, nullptr) != 0;
+        if (!stackLingerArmed) StopStackListener();
+    }
+
+    // The stacking hook is desktop-wide and receives window and cursor
+    // location changes at input rate, so it is installed only while an
+    // overlay is on screen (and briefly after): with nothing visible there
+    // is nothing to keep above other windows.
+    bool WatchStacking(bool watch) {
+        if (!watch) { UnwatchStacking(); return true; }
+        stackWatching.store(true);
+        if (stackLingerArmed) KillTimer(controller.load(), kStackLingerTimer);
+        stackLingerArmed = false;
+        if (stackListening) return true;
+        // The overlay that needs it was just placed at the top of the
+        // topmost band, so nothing it missed before this can cover it.
+        std::wstring error;
+        if (!stackListener.Start({{EVENT_OBJECT_SHOW, EVENT_OBJECT_REORDER},
+                {EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE},
+                {EVENT_SYSTEM_MENUSTART, EVENT_SYSTEM_MENUPOPUPEND}},
+                StackEvent, this, error)) {
+            Fail(error);
+            return false;
+        }
+        stackListening = true;
+        return true;
+    }
+
+    void HideAll() noexcept {
+        UnwatchStacking();
         CancelFrame();
         HidePointer();
         HideKeys();
@@ -1960,6 +2169,9 @@ struct VisualEffects::Impl {
         } else if (!spotlight.visible || spotlight.lastPoint.x != point.x || spotlight.lastPoint.y != point.y) {
             highlightMoves.fetch_add(1, std::memory_order_relaxed);
         }
+        // Showing a hidden dim layer puts it at the top of the topmost band,
+        // above a lens or key display that stayed visible meanwhile.
+        raise = raise || !spotlight.visible;
         if (!spotlight.Place(point, raise, error)) { Fail(error); return false; }
         // The dim layer was just raised: keep the lens and key display above it.
         if (raise) RaiseAboveSpotlight();
@@ -2156,10 +2368,12 @@ struct VisualEffects::Impl {
                 ++last->repeat;
                 last->updated = now;
                 last->dirty = true;
+                last->preview = last->preview && preview;
             } else {
                 KeyStroke stroke;
                 stroke.caps = std::move(caps);
                 stroke.updated = now;
+                stroke.preview = preview;
                 strokes.push_back(std::move(stroke));
             }
         }
@@ -2210,14 +2424,12 @@ struct VisualEffects::Impl {
         return true;
     }
 
-    // Re-presents the cached pixels with the current breathing fade. This is a
-    // blend-only update: no rasterization and no window move.
+    // Applies the current breathing fade to the cached pixels. This is a
+    // blend-only update: no rasterization, no pixel upload and no window move.
     bool RenderBreath(LONGLONG now) {
         if (!config.breathing || !highlight.visible || config.highlightStyle == kHighlightSpotlight || !highlightPixelsReady) return true;
         std::wstring error;
-        const BYTE fade = BreathFade(now);
-        if (fade == highlight.lastFade) return true;
-        if (!highlight.Present(highlight.lastCenter, fade, error)) { Fail(error); return false; }
+        if (!highlight.Fade(BreathFade(now), error)) { Fail(error); return false; }
         return true;
     }
 
@@ -2264,9 +2476,10 @@ struct VisualEffects::Impl {
             const double remaining = std::clamp(1.0 - fraction, 0.0, 1.0);
             const BYTE alpha = static_cast<BYTE>(remaining * remaining * 255.0 + 0.5);
             std::wstring error;
-            // Stamp pixels and positions are immutable; only their opacity fades.
-            // A separate bounded pass handles desktop stacking changes.
-            if (!stamp.surface.Present(stamp.origin, alpha, error)) {
+            // Stamp pixels and positions are immutable; only their opacity
+            // fades, so the pixels uploaded once are never sent again. A
+            // separate bounded pass handles desktop stacking changes.
+            if (!stamp.surface.Fade(alpha, error)) {
                 Fail(error); return false;
             }
         }
@@ -2305,15 +2518,18 @@ struct VisualEffects::Impl {
         return true;
     }
 
+    // Idle-hide is for a resting visible pointer. While the pointer is hidden
+    // the frame that applies it never gets that far, so a deadline armed for
+    // a held spotlight would only wake the renderer again and again.
     LONGLONG IdleHideDeadline() const noexcept {
-        if (!config.idleHideMs || !HighlightVisible() || idleHidden || !lastPointerActivity) return 0;
+        if (!config.idleHideMs || pointerGone || !HighlightVisible() || idleHidden || !lastPointerActivity) return 0;
         return lastPointerActivity + frequency * config.idleHideMs / 1000;
     }
 
     void FinishFrame() {
         if (!MayShow() && !MayShowKeys()) { HideAll(); return; }
         if (!MayShow()) PointerHidden();
-        stackWatching.store(HighlightVisible() || AnyParticles() || AnyTrail() || lens.visible || keyPanel.visible);
+        if (!WatchStacking(HighlightVisible() || AnyParticles() || AnyTrail() || lens.visible || keyPanel.visible)) return;
         if (!pointerDirty.load()) pointerScheduled.store(false);
         // A producer may have set dirty while it still observed scheduled=true.
         // Recheck after releasing that flag so the final movement is never lost.
@@ -2326,6 +2542,9 @@ struct VisualEffects::Impl {
         };
         if (MayShow()) {
             if (pointerDirty.load()) include(nextMotionFrame);
+            // A drawn lead is dropped when the pointer brings no new position
+            // in time, so the effects settle on the pointer when it stops.
+            if (leadApplied && leadSettle) include(leadSettle);
             if (AnyParticles() || AnyTrail() || trailMotionPending) include(nextAnimationFrame);
             if (const LONGLONG idle = IdleHideDeadline()) include(idle);
             if (config.breathing && highlight.visible && config.highlightStyle != kHighlightSpotlight) {
@@ -2335,8 +2554,10 @@ struct VisualEffects::Impl {
             }
         }
         // The lens re-reads the screen at a modest rate while the pointer
-        // rests or is hidden, so video and typing under it stay live.
+        // rests or is held while typing, so video and typing under it stay live.
         if (lens.visible && nextLensFrame) include(nextLensFrame);
+        // A typing hold is checked again when it would run out.
+        if (typingHold && holdUntil) include(holdUntil);
         if (stackDirty) include(std::max(nextMotionFrame, nextStackCheck));
         if (keyPanel.visible && nextKeyFrame) include(nextKeyFrame);
         if (needed) ArmFrame(deadline);
@@ -2409,7 +2630,6 @@ struct VisualEffects::Impl {
             Fail(error);
             return false;
         }
-        clickFrames.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -2417,11 +2637,14 @@ struct VisualEffects::Impl {
     // ended early (a failure, or the pointer effects were hidden).
     bool RenderPointerFrame(LONGLONG now) {
         POINT point{};
-        if (!VisibleCursor(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
+        if (!SamplePointer(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
         UpdateMonitor(point);
         const bool move = pointerDirty.load() && now >= nextMotionFrame;
-        if (move) { lastPointerActivity = now; idleHidden = false; }
-        if (move || stackDirty) {
+        // The settle check does not take a motion frame: new input right
+        // after it is still drawn at the next motion deadline.
+        const bool settle = !move && leadApplied && leadSettle && now >= leadSettle;
+        if (move) { lastPointerActivity = now; idleHidden = false; PointerMoved(); }
+        if (move || settle || stackDirty) {
             if (move) {
                 pointerDirty.exchange(false);
                 if (config.trail && config.trailOpacity > 0) trailMotionPending = true;
@@ -2429,10 +2652,12 @@ struct VisualEffects::Impl {
             }
             // Cached pointer feedback is first. Sample immediately before its
             // move, after monitor work and before particle/trail rasterization.
-            if (!VisibleCursor(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
+            if (!SamplePointer(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
             UpdateMonitor(point);
-            if (!RenderHighlight(point)) return false;
-            if (move && !RenderLens(point)) return false;
+            const POINT ahead = move ? LeadPoint(point, CounterNow())
+                              : settle ? SettleLead(point, CounterNow()) : LeadApplied(point);
+            if (!RenderHighlight(ahead)) return false;
+            if ((move || settle) && !RenderLens(ahead)) return false;
         }
         if (const LONGLONG idle = IdleHideDeadline(); idle && now >= idle) {
             idleHidden = true;
@@ -2443,14 +2668,14 @@ struct VisualEffects::Impl {
             nextBreathFrame = AdvanceDeadline(nextBreathFrame, now, std::max<LONGLONG>(1, frequency / 30));
         }
         if (lens.visible && nextLensFrame && now >= nextLensFrame) {
-            if (!VisibleCursor(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
-            if (!RenderLens(point)) return false;
+            if (!SamplePointer(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
+            if (!RenderLens(LeadApplied(point))) return false;
         }
         if ((AnyParticles() || AnyTrail() || trailMotionPending) && now >= nextAnimationFrame) {
             const LONGLONG workStarted = CounterNow();
             const LONGLONG previous = lastAnimationFrame;
             lastAnimationFrame = workStarted;
-            if (!VisibleCursor(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
+            if (!SamplePointer(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
             if (!RenderTrail(point, workStarted)) return false;
             trailMotionPending = false;
             for (auto& particle : particles) {
@@ -2473,9 +2698,11 @@ struct VisualEffects::Impl {
                 pointerDirty.exchange(false);
                 lastPointerActivity = finished; idleHidden = false;
                 if (config.trail && config.trailOpacity > 0) trailMotionPending = true;
-                if (!VisibleCursor(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
-                if (!RenderHighlight(point)) return false;
-                if (!RenderLens(point)) return false;
+                if (!SamplePointer(point)) { PointerHidden(); RefreshHeldLens(now); return false; }
+                PointerMoved();
+                const POINT ahead = LeadPoint(point, CounterNow());
+                if (!RenderHighlight(ahead)) return false;
+                if (!RenderLens(ahead)) return false;
                 nextMotionFrame = AdvanceDeadline(nextMotionFrame, finished, motionInterval);
             }
         }
@@ -2508,6 +2735,7 @@ struct VisualEffects::Impl {
     }
 
     void PointerKick() {
+        holdKickPending.store(false);
         pointerWakeups.fetch_add(1, std::memory_order_relaxed);
         if (!PointerWanted()) {
             pointerDirty.store(false);
@@ -2535,6 +2763,10 @@ struct VisualEffects::Impl {
         // A changed spotlight is repainted in place on the next render: one
         // window swaps its whole content at once, so nothing is hidden first.
         if (recover || HighlightAppearanceChanged(previous, config)) highlightPixelsReady = false;
+        // A halo keeps the opacity of its last breath until it is presented
+        // again, so switching breathing off repaints it at full opacity.
+        if (!config.breathing && highlight.lastFade != 255 && config.highlightStyle != kHighlightSpotlight)
+            highlightPixelsReady = false;
         if (!SpotlightWanted()) spotlight.Reset(); // Frees the monitor-sized surface.
         if (recover || TrailAppearanceChanged(previous, config)) ClearTrail();
         if (previous.refreshRate != config.refreshRate) currentMonitor = nullptr;
@@ -2546,16 +2778,27 @@ struct VisualEffects::Impl {
         if (recover || MagnifierAppearanceChanged(previous, config) || previous.magnifier != config.magnifier) lensUnavailable = false;
         if (recover) lens.Reset();
         if (!config.magnifier) HideLens();
-        if (!config.keyDisplay && keyPanel.visible) HideKeys();
+        // The switch removes real rows only: a sample shown with the switch
+        // off stays, so the appearance sliders can be tuned against it.
+        bool keyRowsRemoved = false;
+        if (!config.keyDisplay && keyPanel.visible) {
+            auto& strokes = keyPanel.strokes;
+            const std::size_t rows = strokes.size();
+            strokes.erase(std::remove_if(strokes.begin(), strokes.end(),
+                [](const KeyStroke& stroke) { return !stroke.preview; }), strokes.end());
+            keyRowsRemoved = strokes.size() != rows;
+            if (strokes.empty()) HideKeys();
+        }
         if (!MayShow() && !MayShowKeys()) { HideAll(); return; }
-        if (keyPanel.visible && (recover || KeyAppearanceChanged(previous, config) || previous.captureVisible != config.captureVisible)) {
+        if (keyPanel.visible && (keyRowsRemoved || recover || KeyAppearanceChanged(previous, config) ||
+                                 previous.captureVisible != config.captureVisible)) {
             for (auto& stroke : keyPanel.strokes) stroke.dirty = true;
             if (!PaintKeyPanel()) return;
         }
         if (!MayShow()) { PointerHidden(); if (!RefreshHeldSpotlight()) return; FinishFrame(); return; }
         if (!config.clicks || config.clickOpacity == 0) ClearParticles();
         POINT point{};
-        if (!VisibleCursor(point)) { PointerHidden(); if (!RefreshHeldSpotlight()) return; FinishFrame(); return; }
+        if (!SamplePointer(point)) { PointerHidden(); if (!RefreshHeldSpotlight()) return; FinishFrame(); return; }
         UpdateMonitor(point, recover || previous.refreshRate != config.refreshRate);
         // Keep the visible window and existing click particles while sliders or
         // unrelated settings change. A changed halo is repainted in place.
@@ -2570,7 +2813,7 @@ struct VisualEffects::Impl {
         if (!MayShow() && !MayShowKeys()) { HideAll(); return; }
         if (!MayShow()) { PointerHidden(); FinishFrame(); return; }
         POINT point{};
-        if (!VisibleCursor(point)) { PointerHidden(); FinishFrame(); return; }
+        if (!SamplePointer(point)) { PointerHidden(); FinishFrame(); return; }
         UpdateMonitor(point);
         if (!RenderHighlight(point)) return;
         if (!RenderLens(point, true)) return;
@@ -2620,7 +2863,7 @@ struct VisualEffects::Impl {
         if (!MayShow() || !config.clicks || config.clickOpacity == 0 ||
             ageMs >= config.durationMs) return;
         POINT current{};
-        if (!VisibleCursor(current)) { PointerHidden(); FinishFrame(); return; }
+        if (!SamplePointer(current)) { PointerHidden(); FinishFrame(); return; }
         UpdateMonitor(current);
         const unsigned selected = buttons & config.buttons;
         if ((selected & 1) && !SpawnParticle(1, point, started)) return;
@@ -2670,6 +2913,12 @@ struct VisualEffects::Impl {
                     (self->MayShowKeys() && (self->keyPanel.visible || self->spotlight.visible || self->lens.visible)))
                     self->RequestFrame();
                 else { self->stackDirty = false; self->stackQueued.store(false); }
+                return 0;
+            case WM_TIMER:
+                if (wParam != kStackLingerTimer) return DefWindowProcW(window, message, wParam, lParam);
+                KillTimer(window, kStackLingerTimer);
+                self->stackLingerArmed = false;
+                if (!self->stackWatching.load()) self->StopStackListener();
                 return 0;
             case kMonitorChanged:
             case WM_DISPLAYCHANGE:
@@ -2749,11 +2998,8 @@ struct VisualEffects::Impl {
         }
         controller.store(window);
         // Delivery itself can be expensive even when a callback ignores the
-        // event. Isolate global WinEvent traffic from the frame message queue.
-        if (!stackListener.Start({{EVENT_OBJECT_SHOW, EVENT_OBJECT_REORDER},
-                {EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE},
-                {EVENT_SYSTEM_MENUSTART, EVENT_SYSTEM_MENUPOPUPEND}},
-                StackEvent, this, error)) return false;
+        // event, so global WinEvent traffic is isolated from the frame message
+        // queue on its own receiver, which WatchStacking starts when needed.
         shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (shcore) {
             const FARPROC address = GetProcAddress(shcore, "GetDpiForMonitor");
@@ -2774,8 +3020,8 @@ struct VisualEffects::Impl {
     void Cleanup() noexcept {
         accepting.store(false);
         allowed.store(false);
+        StopStackListener();
         stackWatching.store(false);
-        stackListener.Stop();
         stackQueued.store(false);
         HideAll();
         for (auto& particle : particles) particle.surface.Reset();
@@ -2908,6 +3154,17 @@ void VisualEffects::SetAllowed(bool allowed, bool keyDisplayAllowed) {
 }
 
 void VisualEffects::PointerActivity() noexcept { impl_->QueuePointer(); }
+void VisualEffects::MouseInput() noexcept {
+    // Zero means "never"; a tick of exactly zero is moved by one millisecond.
+    const DWORD tick = GetTickCount();
+    impl_->lastMouseInputTick.store(tick ? tick : 1, std::memory_order_relaxed);
+    // A typing hold that began just before this input (the hide reached the
+    // renderer first) is checked again right away rather than at its end.
+    if (impl_->holdActive.load(std::memory_order_relaxed) && !impl_->holdKickPending.exchange(true)) {
+        const HWND window = impl_->controller.load();
+        if (!window || !PostMessageW(window, kPointerKick, 0, 0)) impl_->holdKickPending.store(false);
+    }
+}
 
 void VisualEffects::Key(unsigned virtualKey, unsigned scanCode, bool extended, unsigned modifiers) noexcept {
     if (!impl_->accepting.load() || !impl_->keyAllowed.load() || !impl_->renderHealthy.load() ||
@@ -2967,7 +3224,6 @@ VisualEffectsStats VisualEffects::Stats() const noexcept {
     result.frameCount = impl_->frameCount.load(std::memory_order_relaxed);
     result.highlightMoves = impl_->highlightMoves.load(std::memory_order_relaxed);
     result.highlightRasterizations = impl_->highlightRasterizations.load(std::memory_order_relaxed);
-    result.clickFrames = impl_->clickFrames.load(std::memory_order_relaxed);
     result.pointerWakeups = impl_->pointerWakeups.load(std::memory_order_relaxed);
     result.stackWakeups = impl_->stackWakeups.load(std::memory_order_relaxed);
     result.magnifierUpdates = impl_->magnifierUpdates.load(std::memory_order_relaxed);

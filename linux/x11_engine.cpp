@@ -1,12 +1,14 @@
 #include "engine.h"
 #include "audio.h"
 #include "x11_errors.h"
+#include "game_detection.h"
 #include "../src/frame_pacing.h"
 #include "../src/shake_locator.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
+#include <X11/Xresource.h>
 #include <X11/extensions/XInput2.h>
 #include <X11/XKBlib.h>
 #include <X11/keysym.h>
@@ -24,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -49,6 +52,12 @@ constexpr std::size_t kKeyRowLimit = 3; // Rows on the key display; the oldest l
 constexpr std::size_t kTypedBytes = 480; // UTF-8 bytes kept in one typed row.
 constexpr auto kKeyFade = std::chrono::milliseconds(350);
 constexpr auto kLensInterval = std::chrono::milliseconds(33); // Live lens redraws while the pointer rests.
+constexpr auto kBreathInterval = std::chrono::milliseconds(33); // Breathing keeps 30 Hz whatever the frame limit.
+// A pointer hidden this soon after a key press was hidden by typing; the
+// spotlight and the lens then stay until this long after the last key.
+constexpr auto kTypingStart = std::chrono::milliseconds(1500);
+constexpr auto kTypingHold = std::chrono::milliseconds(3000);
+constexpr auto kGeometryDelay = std::chrono::milliseconds(60); // Coalesces foreground moves and resizes.
 double Seconds(TimePoint now) { return std::chrono::duration<double>(now.time_since_epoch()).count(); }
 constexpr auto kSafetyInterval = std::chrono::milliseconds(200);
 
@@ -293,6 +302,7 @@ private:
     bool SelectInput();
     void RawKey(const XIRawEvent* raw, bool pressed);
     unsigned CurrentModifiers();
+    bool RulesAllowKeys() const noexcept;
     bool KeysAllowed() const noexcept;
     void ShowKey(KeySym symbol, unsigned modifiers, const std::string& typed = {});
     std::string TypedText(KeyCode code, unsigned modifiers);
@@ -300,11 +310,15 @@ private:
     void HideKeys() noexcept;
     void PaintLens(TimePoint now);
     void HideLens() noexcept;
+    void ScheduleHeldLens();
     void ScheduleKeyFrame();
     void RawButton(int device, unsigned button, bool down);
     void ReconcileButtons();
     void UpdatePointerDevices();
     void UpdateForeground(bool force = false);
+    ProcessIdentity ReadProcess(unsigned long pid);
+    double ResourceScale(bool initial);
+    void RefreshScale();
     void UpdateMonitors();
     void UpdatePointer();
     void CaptureCursor();
@@ -364,6 +378,11 @@ private:
         desktopAtom_ = None, dockAtom_ = None, pidAtom_ = None, compositorAtom_ = None,
         frameExtentsAtom_ = None, maximizedHorizontalAtom_ = None, maximizedVerticalAtom_ = None;
     bool foregroundFullscreen_ = false, foregroundExcluded_ = false, foregroundShell_ = false, foregroundAllowed_ = false;
+    bool foregroundGame_ = false;
+    // Moves and resizes of the foreground window are re-read at most every
+    // kGeometryDelay; a drag sends one ConfigureNotify per motion step.
+    bool foregroundGeometryPending_ = false;
+    TimePoint foregroundGeometryDue_{};
     std::string foregroundName_, graphicsError_;
     std::vector<std::string> exclusions_, allowances_;
     std::vector<Monitor> monitors_;
@@ -372,14 +391,16 @@ private:
     int pointerX_ = 0, pointerY_ = 0;
     double scale_ = 1.0;
     bool cursorVisible_ = true, allowed_ = false, ownHide_ = false, pointerDirty_ = true;
-    // Paused only because the application shows a transparent cursor (editors
-    // do that while you type): the spotlight and the lens keep their place.
+    // The application hid the pointer right after a key press (editors do
+    // that while you type): the spotlight and the lens keep their place until
+    // the pointer returns or kTypingHold after the last key.
     bool typingHold_ = false;
+    TimePoint lastKey_{}; // Last key press, known only while keys are observed.
     bool cursorDirty_ = true, highlightDirty_ = true, pressed_ = false;
     bool lastLocked_ = false;
     bool pulse_ = false, frameScheduled_ = false;
     TimePoint pulseDeadline_{}, nextFrame_{}, nextSafety_{}, lastRuleCheck_{};
-    TimePoint nextPointerFrame_{}, nextEffectsFrame_{}, lastEffectsFrame_{};
+    TimePoint nextPointerFrame_{}, nextEffectsFrame_{}, lastEffectsFrame_{}, nextBreathFrame_{};
     AdaptiveFramePacer framePacer_;
     ShakeLocator shake_;
     bool shakeMotionPending_ = false;
@@ -401,16 +422,25 @@ private:
     TimePoint lastMotion_{};
     // Key display: rows of keycaps (or typed text) that live in memory only
     // while shown. Each row fades on its own after the hold time.
-    struct KeyStroke { std::vector<std::string> caps; std::string typed; unsigned repeat = 1; TimePoint updated{}; };
+    // clipped: older characters of a typed row were dropped to fit the screen.
+    struct KeyStroke { std::vector<std::string> caps; std::string typed; unsigned repeat = 1; TimePoint updated{}; bool clipped = false; };
+    // Measured once per change of the rows; fade frames only redraw them.
+    struct KeyRow { std::vector<double> caps; std::string typed, count; double contentWidth = 0, countWidth = 0, width = 0; };
     Overlay keyPanel_;
     std::vector<KeyStroke> keyStrokes_;
+    std::vector<KeyRow> keyRows_;
     TimePoint keyDeadline_{};
     bool keyVisible_ = false, keyDirty_ = false;
+    int keyLayoutWidth_ = 0; // Monitor width the cached key rows were measured for.
     unsigned chordModifiers_ = 0;
     bool modifierChordUsed_ = false;
     // Magnifier lens beside the pointer, refreshed from the screen.
     Overlay lens_;
     bool lensVisible_ = false;
+    // What the last lens frame showed: it is redrawn when the pointer, its
+    // artwork or the settings change, otherwise only every kLensInterval.
+    bool lensDirty_ = true, lensPressed_ = false;
+    int lensX_ = 0, lensY_ = 0;
     TimePoint nextLensFrame_{};
     std::string lensError_;
     std::array<Particle, kParticleCount> particles_{};
@@ -509,6 +539,7 @@ bool X11Engine::Initialize(std::string& error) {
     { std::lock_guard<std::mutex> lock(mutex_); settings_ = pending_; }
     held_ = 0; devices_.clear(); foreground_ = None; foregroundName_.clear(); masterPointer_ = 0;
     allowed_ = pressed_ = ownHide_ = pulse_ = frameScheduled_ = typingHold_ = false;
+    cursorVisible_ = true; lastKey_ = {}; foregroundGame_ = foregroundGeometryPending_ = false;
     trailMotionPending_ = trailAnchorSet_ = stackDirty_ = stackOrderDirty_ = foreignStackDirty_ = false;
     nextParticle_ = nextTrail_ = 0;
     pointerDirty_ = cursorDirty_ = highlightDirty_ = true;
@@ -517,14 +548,14 @@ bool X11Engine::Initialize(std::string& error) {
     inputEvents_ = renderedFrames_ = wakeups_ = 0;
     inputSnapshot_.store(0); frameSnapshot_.store(0); wakeSnapshot_.store(0);
     nextFrame_ = {}; nextSafety_ = {}; lastRuleCheck_ = {};
-    nextPointerFrame_ = {}; nextEffectsFrame_ = {}; lastEffectsFrame_ = {};
+    nextPointerFrame_ = {}; nextEffectsFrame_ = {}; lastEffectsFrame_ = {}; nextBreathFrame_ = {};
     framePacer_ = {};
     shake_.Configure(settings_.shakeStyle, settings_.shakeSensitivity, settings_.shakeMaximumScale);
     shakeMotionPending_ = false; pointerMonitor_ = -1; paintedCursor_ = nullptr; shakeError_.clear();
     keyboardSelected_ = keyboardReleases_ = false; lastMotion_ = Clock::now();
-    keyStrokes_.clear(); keyVisible_ = keyDirty_ = false; keyDeadline_ = {}; chordModifiers_ = 0; modifierChordUsed_ = false;
+    keyStrokes_.clear(); keyRows_.clear(); keyVisible_ = keyDirty_ = false; keyDeadline_ = {}; chordModifiers_ = 0; modifierChordUsed_ = false;
     spotHole_ = {}; spotSize_ = 0;
-    lensVisible_ = false; nextLensFrame_ = {}; lensError_.clear();
+    lensVisible_ = false; lensDirty_ = true; nextLensFrame_ = {}; lensError_.clear();
     exclusions_ = ParseExclusions(settings_.excludedProcesses);
     allowances_ = ParseExclusions(settings_.allowedProcesses);
     display_ = XOpenDisplay(nullptr);
@@ -581,10 +612,7 @@ bool X11Engine::Initialize(std::string& error) {
     if (visuals) XFree(visuals);
     if (visual_) colormap_ = XCreateColormap(display_, root_, visual_, AllocNone);
     else graphicsError_ = "This X server has no 32-bit ARGB visual; cursor and visual overlays are unavailable.";
-    if (const char* dpi = XGetDefault(display_, "Xft", "dpi")) {
-        char* end = nullptr; const double value = std::strtod(dpi, &end);
-        if (end != dpi && std::isfinite(value)) scale_ = std::clamp(value / 96.0, 1.0, 3.0);
-    }
+    scale_ = ResourceScale(true);
     // Validate required subscriptions/resources before querying another
     // application's window. Its XID can disappear while GTK/WM windows are
     // being created; that ordinary BadWindow race is not a setup failure.
@@ -602,8 +630,42 @@ bool X11Engine::Initialize(std::string& error) {
     ApplyPolicy(); ScheduleFrame(true);
     return true;
 }
+// Effect sizes follow Xft.dpi. RESOURCE_MANAGER holds the live resources;
+// XGetDefault only knows the copy taken when the connection was opened, and
+// is used just at start for a server without the property (~/.Xdefaults).
+double X11Engine::ResourceScale(bool initial) {
+    std::string dpi;
+    Atom actual = None; int format = 0; unsigned long count = 0, after = 0; unsigned char* data = nullptr;
+    if (XGetWindowProperty(display_, root_, XA_RESOURCE_MANAGER, 0, 1L << 18, False, XA_STRING,
+            &actual, &format, &count, &after, &data) == Success && data && actual == XA_STRING && format == 8) {
+        const std::string text(reinterpret_cast<const char*>(data), count);
+        XrmInitialize();
+        if (XrmDatabase database = XrmGetStringDatabase(text.c_str())) {
+            char* type = nullptr; XrmValue value{};
+            if (XrmGetResource(database, "Xft.dpi", "Xft.Dpi", &type, &value) && value.addr && value.size)
+                dpi.assign(value.addr, strnlen(value.addr, value.size));
+            XrmDestroyDatabase(database);
+        }
+    } else if (initial) {
+        if (const char* fallback = XGetDefault(display_, "Xft", "dpi")) dpi = fallback;
+    }
+    if (data) XFree(data);
+    char* end = nullptr; const double value = std::strtod(dpi.c_str(), &end);
+    return end != dpi.c_str() && std::isfinite(value) ? std::clamp(value / 96.0, 1.0, 3.0) : 1.0;
+}
+// A display-scale change while running rescales every effect at once, as
+// the settings window does.
+void X11Engine::RefreshScale() {
+    const double next = ResourceScale(false);
+    if (next == scale_) return;
+    scale_ = next;
+    highlightDirty_ = keyDirty_ = lensDirty_ = true; spotlight_.painted = false;
+    shake_.Reset(); trailAnchorSet_ = false;
+    pointerDirty_ = true; ScheduleFrame(true);
+    if (keyVisible_) ScheduleKeyFrame();
+}
 void X11Engine::UpdateMonitors() {
-    shake_.Reset(); pointerMonitor_ = -1;
+    shake_.Reset(); pointerMonitor_ = -1; lensDirty_ = true;
     monitors_.clear();
     if (randr_) if (auto* resources = XRRGetScreenResourcesCurrent(display_, root_)) {
         for (int i = 0; i < resources->ncrtc; ++i) if (auto* crtc = XRRGetCrtcInfo(display_, resources, resources->crtcs[i])) {
@@ -659,7 +721,44 @@ void X11Engine::UpdatePointerDevices() {
     // Never hide unrelated pointers to replace just this client's pointer.
     multiplePointers_ = pointers != 1;
 }
+// The executable, arguments and parent process names of a window's process,
+// read once per foreground change. Every read is bounded.
+ProcessIdentity X11Engine::ReadProcess(unsigned long pid) {
+    ProcessIdentity process;
+    if (!pid || pid > static_cast<unsigned long>(std::numeric_limits<int>::max())) return process;
+    const auto prefix = "/proc/" + std::to_string(pid);
+    std::array<char, 4096> path{};
+    const ssize_t length = readlink((prefix + "/exe").c_str(), path.data(), path.size() - 1);
+    if (length > 0) process.executable.assign(path.data(), static_cast<std::size_t>(length));
+    std::ifstream command(prefix + "/cmdline", std::ios::binary);
+    std::array<char, 16384> arguments{};
+    command.read(arguments.data(), arguments.size());
+    const std::string joined(arguments.data(), static_cast<std::size_t>(std::max<std::streamsize>(0, command.gcount())));
+    for (std::size_t begin = 0; begin < joined.size() && process.arguments.size() < 64;) {
+        const auto end = std::min(joined.find('\0', begin), joined.size());
+        process.arguments.push_back(joined.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    // Parent names show a game started inside gamescope.
+    unsigned long current = pid;
+    for (unsigned depth = 0; depth < 16; ++depth) {
+        std::ifstream stat("/proc/" + std::to_string(current) + "/stat");
+        std::string line;
+        if (!std::getline(stat, line)) break;
+        // The command name may itself contain spaces and parentheses.
+        const auto close = line.rfind(')');
+        unsigned long parent = 0;
+        if (close == std::string::npos || std::sscanf(line.c_str() + close + 1, " %*c %lu", &parent) != 1 || parent <= 1) break;
+        std::ifstream comm("/proc/" + std::to_string(parent) + "/comm");
+        std::string name;
+        if (!std::getline(comm, name)) break;
+        process.ancestors.push_back(std::move(name));
+        current = parent;
+    }
+    return process;
+}
 void X11Engine::UpdateForeground(bool force) {
+    foregroundGeometryPending_ = false;
     const auto active = Property(root_, activeAtom_, XA_WINDOW, 1);
     Window window = active.empty() ? None : active.front();
     if (!window) { int revert; XGetInputFocus(display_, &window, &revert); if (window == PointerRoot) window = root_; }
@@ -668,26 +767,29 @@ void X11Engine::UpdateForeground(bool force) {
         if (foreground_ && foreground_ != root_) XSelectInput(display_, foreground_, NoEventMask);
         foreground_ = window;
         if (foreground_ && foreground_ != root_) XSelectInput(display_, foreground_, StructureNotifyMask | PropertyChangeMask | FocusChangeMask);
-        foregroundName_.clear(); foregroundExcluded_ = foregroundAllowed_ = false;
+        foregroundName_.clear(); foregroundExcluded_ = foregroundAllowed_ = foregroundGame_ = false;
         std::vector<std::string> names;
         const auto pids = Property(foreground_, pidAtom_, XA_CARDINAL, 1);
-        if (!pids.empty() && pids.front() > 0 && pids.front() <= std::numeric_limits<int>::max()) {
-            const auto prefix = "/proc/" + std::to_string(pids.front());
-            std::array<char, 4096> path{};
-            const ssize_t length = readlink((prefix + "/exe").c_str(), path.data(), path.size() - 1);
-            if (length > 0) {
-                std::string name(path.data(), static_cast<std::size_t>(length));
-                name = name.substr(name.find_last_of('/') + 1);
-                foregroundName_ = name; names.push_back(Lower(name));
-            }
-            std::ifstream command(prefix + "/comm"); std::string name;
+        const unsigned long pid = pids.empty() ? 0 : pids.front();
+        ProcessIdentity process = ReadProcess(pid);
+        if (!process.executable.empty()) {
+            const auto name = process.executable.substr(process.executable.find_last_of('/') + 1);
+            foregroundName_ = name; names.push_back(Lower(name));
+        }
+        if (pid > 0 && pid <= static_cast<unsigned long>(std::numeric_limits<int>::max())) {
+            std::ifstream command("/proc/" + std::to_string(pid) + "/comm"); std::string name;
             if (std::getline(command, name)) names.push_back(Lower(name));
         }
         XClassHint hint{};
         if (foreground_ && XGetClassHint(display_, foreground_, &hint)) {
-            if (hint.res_name) { names.push_back(Lower(hint.res_name)); if (foregroundName_.empty()) foregroundName_ = hint.res_name; XFree(hint.res_name); }
-            if (hint.res_class) { names.push_back(Lower(hint.res_class)); XFree(hint.res_class); }
+            if (hint.res_name) {
+                names.push_back(Lower(hint.res_name)); process.windowClasses.emplace_back(hint.res_name);
+                if (foregroundName_.empty()) foregroundName_ = hint.res_name;
+                XFree(hint.res_name);
+            }
+            if (hint.res_class) { names.push_back(Lower(hint.res_class)); process.windowClasses.emplace_back(hint.res_class); XFree(hint.res_class); }
         }
+        foregroundGame_ = LooksLikeGame(process);
         for (const auto& name : names) {
             if (std::find(exclusions_.begin(), exclusions_.end(), name) != exclusions_.end()) foregroundExcluded_ = true;
             if (std::find(allowances_.begin(), allowances_.end(), name) != allowances_.end()) foregroundAllowed_ = true;
@@ -752,17 +854,28 @@ void X11Engine::CaptureCursor() {
             cairo_surface_mark_dirty(dark); cairo_surface_mark_dirty(normal);
         } else { cairo_surface_destroy(dark); cairo_surface_destroy(normal); dark = normal = nullptr; }
     }
-    ClearShakeCache();
+    ClearShakeCache(); shakeError_.clear();
     if (darkImage_) cairo_surface_destroy(darkImage_);
     if (normalImage_) cairo_surface_destroy(normalImage_);
     normalImage_ = normal; darkImage_ = dark; cursorHotX_ = image->xhot; cursorHotY_ = image->yhot;
+    // A completely transparent image is a hidden pointer (Firefox shows one
+    // for CSS cursor:none, editors while you type).
+    const bool wasVisible = cursorVisible_;
     cursorVisible_ = visible || !valid;
-    cursorDirty_ = true;
+    // Hidden right after a key press means typing: the spotlight and the
+    // lens stay. Any other hidden pointer (an idle video, a game) hides them.
+    const auto now = Clock::now();
+    if (cursorVisible_) typingHold_ = false;
+    else if (wasVisible) typingHold_ = keyboardSelected_ && lastKey_ != TimePoint{} && now - lastKey_ <= kTypingStart;
+    cursorDirty_ = lensDirty_ = true;
     XFree(image);
-    RebuildShakeCache();
+    // Enlarged frames are built when a shake begins, not for every shape the
+    // pointer takes while browsing; only a change during an enlargement
+    // needs them at once.
+    if (shake_.Active(Seconds(now))) RebuildShakeCache();
     if (!darkImage_) RestorePointer();
     ApplyPolicy();
-    if (pressed_ || shake_.Active(Seconds(Clock::now()))) ScheduleFrame(true);
+    if (pressed_ || shake_.Active(Seconds(now))) ScheduleFrame(true);
 }
 void X11Engine::ClearShakeCache() noexcept {
     for (auto& frame : shakeFrames_) {
@@ -794,8 +907,8 @@ void X11Engine::RebuildShakeCache() {
         shakeError_ = "Shake enlargement is unavailable for this exceptionally large cursor; the normal pointer remains visible.";
         return;
     }
-    // Shape changes and configuration rebuild this bounded image cache. Input
-    // and animation only select existing pixels; no per-frame resampling.
+    // A starting shake builds this bounded image cache once per cursor shape.
+    // Input and animation only select existing pixels; no per-frame resampling.
     for (unsigned i = 0; i < count; ++i) {
         const double scale = 1 + (maximum - 1) * i / (count - 1);
         auto& frame = shakeFrames_[i];
@@ -845,10 +958,13 @@ void X11Engine::RebuildShakeCache() {
 void X11Engine::ObserveShake() {
     if (!shakeMotionPending_) return;
     shakeMotionPending_ = false;
-    if (!settings_.shakeStyle || !allowed_ || multiplePointers_ || !compositor_ || !shakeFrameCount_) { shake_.ClearTrace(); return; }
+    if (!settings_.shakeStyle || !allowed_ || multiplePointers_ || !compositor_ || !normalImage_ || !darkImage_) { shake_.ClearTrace(); return; }
     UpdatePointer();
-    const bool trigger = shake_.Observe(pointerX_ / scale_, pointerY_ / scale_, Seconds(Clock::now()), held_ == 0);
-    if (trigger || shake_.Active(Seconds(Clock::now()))) ScheduleFrame(trigger);
+    const double now = Seconds(Clock::now());
+    const bool trigger = shake_.Observe(pointerX_ / scale_, pointerY_ / scale_, now, held_ == 0);
+    // A failed build resets the locator, so the pointer simply stays native.
+    if ((trigger || shake_.Active(now)) && !shakeFrameCount_) { RebuildShakeCache(); if (!shakeError_.empty()) Publish(); }
+    if (trigger || shake_.Active(now)) ScheduleFrame(trigger);
 }
 void X11Engine::UpdateCursorEffect(double now) {
     const bool possible = allowed_ && compositor_ && visual_ && !graphicsFailed_ && !multiplePointers_ && darkImage_;
@@ -879,34 +995,49 @@ void X11Engine::ClearEffects(bool holdSpotlightAndLens) noexcept {
     trailMotionPending_ = trailAnchorSet_ = stackDirty_ = stackOrderDirty_ = foreignStackDirty_ = false;
     pulse_ = false; frameScheduled_ = false;
 }
+// Only games pause in fullscreen: a fullscreen browser, video player or
+// presentation keeps its effects. Allowed apps always keep them.
 bool X11Engine::FullscreenPaused() const noexcept {
-    return settings_.pauseFullscreen && foregroundFullscreen_ && !foregroundAllowed_;
+    return settings_.pauseFullscreen && foregroundFullscreen_ && foregroundGame_ && !foregroundAllowed_;
 }
 void X11Engine::ApplyPolicy() {
-    const bool otherRule = locked_.load(std::memory_order_acquire) || foregroundExcluded_ || FullscreenPaused();
-    const bool rule = otherRule || !cursorVisible_;
-    const bool permitted = settings_.enabled && !rule;
+    // Every rule except the hidden pointer, which typing must not trip.
+    const bool keyRules = RulesAllowKeys();
+    const bool permitted = keyRules && cursorVisible_;
     if (!KeysAllowed()) HideKeys();
-    typingHold_ = !permitted && settings_.enabled && !otherRule;
+    if (!keyRules || cursorVisible_ || Clock::now() >= lastKey_ + kTypingHold) typingHold_ = false;
+    // Keyboard sounds keep playing while only the pointer is hidden.
+    audio_.SetAllowed(permitted, keyRules);
     if (!permitted) {
         ClearEffects(typingHold_);
-        audio_.SetAllowed(false); allowed_ = false;
+        allowed_ = false;
         if (locked_.load(std::memory_order_relaxed)) { held_ = 0; devices_.clear(); chordModifiers_ = 0; modifierChordUsed_ = false; }
         if (keyVisible_) ScheduleKeyFrame();
+        ScheduleHeldLens();
         Publish(); return;
     }
     const bool wasAllowed = allowed_;
-    allowed_ = true; audio_.SetAllowed(true);
+    allowed_ = true;
     if (pointerDirty_) UpdatePointer();
     UpdateCursorEffect(Seconds(Clock::now()));
     if (!wasAllowed && (settings_.highlightEnabled || settings_.magnifierEnabled)) { pointerDirty_ = true; ScheduleFrame(true); }
     Publish();
 }
+bool X11Engine::RulesAllowKeys() const noexcept {
+    return settings_.enabled && !locked_.load(std::memory_order_relaxed) && !foregroundExcluded_ && !FullscreenPaused();
+}
 bool X11Engine::KeysAllowed() const noexcept {
-    // The key display ignores the transparent-cursor rule: editors hide the
+    // The key display ignores the hidden-pointer rule: editors hide the
     // pointer while you type, which is exactly when the keys should show.
-    return settings_.enabled && settings_.keyDisplayEnabled && !locked_.load(std::memory_order_relaxed) &&
-        !foregroundExcluded_ && !FullscreenPaused() && compositor_ && visual_ && !graphicsFailed_;
+    return RulesAllowKeys() && settings_.keyDisplayEnabled && compositor_ && visual_ && !graphicsFailed_;
+}
+// ScheduleFrame ignores a paused engine; a lens held while typing still
+// refreshes at its resting rate.
+void X11Engine::ScheduleHeldLens() {
+    if (!typingHold_ || !settings_.magnifierEnabled || !lensVisible_ || !compositor_ || !visual_ || graphicsFailed_) return;
+    const auto due = std::max(nextLensFrame_, Clock::now());
+    if (!frameScheduled_ || due < nextFrame_) nextFrame_ = due;
+    frameScheduled_ = true;
 }
 void X11Engine::ScheduleKeyFrame() {
     if (!compositor_ || !visual_ || graphicsFailed_) return;
@@ -936,21 +1067,21 @@ void X11Engine::ShowKey(KeySym symbol, unsigned modifiers, const std::string& ty
     const bool plain = !(modifiers & (kModControl | kModAlt | kModWin | kModMouse));
     if (typing && !typed.empty()) {
         last->typed += typed;
-        while (last->typed.size() > kTypedBytes) DropFirstCharacter(last->typed);
+        while (last->typed.size() > kTypedBytes) { DropFirstCharacter(last->typed); last->clipped = true; }
         last->updated = now;
     } else if (typing && plain && symbol == XK_BackSpace) {
         // Backspace edits the typed row, so it reads like the text itself.
         PopCharacter(last->typed);
         if (last->typed.empty()) keyStrokes_.pop_back(); else last->updated = now;
     } else if (!typed.empty() && typed != " ") {
-        keyStrokes_.push_back({{}, typed, 1, now});
+        keyStrokes_.push_back({{}, typed, 1, now, false});
     } else {
         auto caps = ChordParts(symbol, modifiers);
         if (last && last->typed.empty() && last->caps == caps && now - last->updated < std::chrono::seconds(1)) {
             ++last->repeat;
             last->updated = now;
         } else {
-            keyStrokes_.push_back({std::move(caps), {}, 1, now});
+            keyStrokes_.push_back({std::move(caps), {}, 1, now, false});
         }
     }
     while (keyStrokes_.size() > kKeyRowLimit) keyStrokes_.erase(keyStrokes_.begin());
@@ -973,7 +1104,7 @@ std::string X11Engine::TypedText(KeyCode code, unsigned modifiers) {
 }
 void X11Engine::HideKeys() noexcept {
     Hide(keyPanel_);
-    keyStrokes_.clear(); keyVisible_ = keyDirty_ = false; keyDeadline_ = {};
+    keyStrokes_.clear(); keyRows_.clear(); keyVisible_ = keyDirty_ = false; keyDeadline_ = {};
 }
 // The key display in the style of the Mac keystroke visualizers: each
 // shortcut is a row of keycaps on a rounded translucent panel with a soft
@@ -983,9 +1114,11 @@ void X11Engine::PaintKeyDisplay(TimePoint now) {
     if (!keyVisible_) return;
     if (!KeysAllowed()) { HideKeys(); return; }
     const auto hold = std::chrono::milliseconds(settings_.keyDisplayDurationMs);
+    const auto rowsBefore = keyStrokes_.size();
     keyStrokes_.erase(std::remove_if(keyStrokes_.begin(), keyStrokes_.end(),
         [&](const KeyStroke& stroke) { return now - stroke.updated >= hold + kKeyFade; }), keyStrokes_.end());
     if (keyStrokes_.empty()) { HideKeys(); return; }
+    if (keyStrokes_.size() != rowsBefore) keyDirty_ = true; // The panel changes size.
     std::vector<double> fades;
     bool fading = false;
     TimePoint next{};
@@ -1014,39 +1147,61 @@ void X11Engine::PaintKeyDisplay(TimePoint now) {
     const double corner = std::max(4.0, 16 * s), capCorner = std::max(3.0, 8 * s);
     const double capFont = px(22, 8), typeFont = px(28, 10), countFont = px(19, 7);
     const double margin = shadow + shadowOffset, bubbleHeight = capHeight + 2 * padY;
-    cairo_surface_t* scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
-    cairo_t* measure = cairo_create(scratch);
-    cairo_select_font_face(measure, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-    const auto advance = [&](const std::string& text, double size) {
-        cairo_set_font_size(measure, size);
-        cairo_text_extents_t extents{}; cairo_text_extents(measure, text.c_str(), &extents);
-        return std::ceil(extents.x_advance);
-    };
-    struct RowLayout { std::vector<double> caps; std::string typed, count; double contentWidth = 0, countWidth = 0, width = 0; };
-    std::vector<RowLayout> rows;
-    const double maximumBubble = std::max(capHeight, monitor->width * 0.9 - 2 * margin);
-    for (const auto& stroke : keyStrokes_) {
-        RowLayout row;
-        if (stroke.repeat > 1) { row.count = "\xc3\x97" + std::to_string(stroke.repeat); row.countWidth = advance(row.count, countFont) + 2 * capGap; }
-        if (!stroke.caps.empty()) {
-            for (const auto& cap : stroke.caps) {
-                row.caps.push_back(std::max(capHeight, advance(cap, capFont) + 2 * capPadding));
-                row.contentWidth += row.caps.back() + (row.caps.size() > 1 ? capGap : 0);
+    // Rows are measured again on another monitor width, so the panel always
+    // fits the monitor it is drawn on.
+    if (keyDirty_ || keyRows_.size() != keyStrokes_.size() || monitor->width != keyLayoutWidth_) {
+        keyLayoutWidth_ = monitor->width;
+        cairo_surface_t* scratch = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+        cairo_t* measure = cairo_create(scratch);
+        cairo_select_font_face(measure, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+        const auto advance = [&](const std::string& text, double size) {
+            cairo_set_font_size(measure, size);
+            cairo_text_extents_t extents{}; cairo_text_extents(measure, text.c_str(), &extents);
+            return std::ceil(extents.x_advance);
+        };
+        const std::string ellipsis = "\xe2\x80\xa6";
+        const double maximumBubble = std::max(capHeight, monitor->width * 0.9 - 2 * margin);
+        keyRows_.clear();
+        for (auto& stroke : keyStrokes_) {
+            KeyRow row;
+            if (stroke.repeat > 1) { row.count = "\xc3\x97" + std::to_string(stroke.repeat); row.countWidth = advance(row.count, countFont) + 2 * capGap; }
+            if (!stroke.caps.empty()) {
+                for (const auto& cap : stroke.caps) {
+                    row.caps.push_back(std::max(capHeight, advance(cap, capFont) + 2 * capPadding));
+                    row.contentWidth += row.caps.back() + (row.caps.size() > 1 ? capGap : 0);
+                }
+            } else {
+                // Keep the newest characters; an ellipsis marks the cut. The
+                // stored row is trimmed as well, so the next key and every
+                // fade frame never measure the hidden text again.
+                const double available = std::max(capHeight, maximumBubble - 2 * padX - capPadding - row.countWidth);
+                if (stroke.clipped || advance(stroke.typed, typeFont) > available) {
+                    if (advance(ellipsis + stroke.typed, typeFont) > available) {
+                        std::vector<std::size_t> starts;
+                        for (std::size_t at = 0; at < stroke.typed.size(); ++at)
+                            if ((static_cast<unsigned char>(stroke.typed[at]) & 0xc0) != 0x80) starts.push_back(at);
+                        // Fewest dropped characters that fit; the last one always stays.
+                        if (starts.size() > 1) {
+                            std::size_t low = 1, high = starts.size() - 1;
+                            while (low < high) {
+                                const std::size_t middle = (low + high) / 2;
+                                if (advance(ellipsis + stroke.typed.substr(starts[middle]), typeFont) <= available) high = middle;
+                                else low = middle + 1;
+                            }
+                            stroke.typed.erase(0, starts[low]);
+                        }
+                    }
+                    stroke.clipped = true;
+                    row.typed = ellipsis + stroke.typed;
+                } else row.typed = stroke.typed;
+                row.contentWidth = advance(row.typed, typeFont) + capPadding;
             }
-        } else {
-            // Keep the newest characters; an ellipsis marks the cut.
-            const double available = std::max(capHeight, maximumBubble - 2 * padX - capPadding - row.countWidth);
-            row.typed = stroke.typed;
-            if (advance(row.typed, typeFont) > available) {
-                while (row.typed.size() > 1 && advance("\xe2\x80\xa6" + row.typed, typeFont) > available) DropFirstCharacter(row.typed);
-                row.typed = "\xe2\x80\xa6" + row.typed;
-            }
-            row.contentWidth = advance(row.typed, typeFont) + capPadding;
+            row.width = row.contentWidth + 2 * padX + row.countWidth;
+            keyRows_.push_back(std::move(row));
         }
-        row.width = row.contentWidth + 2 * padX + row.countWidth;
-        rows.push_back(std::move(row));
+        cairo_destroy(measure); cairo_surface_destroy(scratch);
     }
-    cairo_destroy(measure); cairo_surface_destroy(scratch);
+    const auto& rows = keyRows_;
     double widest = 0;
     for (const auto& row : rows) widest = std::max(widest, row.width);
     const int count = static_cast<int>(rows.size());
@@ -1147,12 +1302,19 @@ void X11Engine::PaintLens(TimePoint now) {
     const int size = std::clamp(static_cast<int>(std::lround(settings_.magnifierSize * scale_)), 40, 2400);
     const double zoom = settings_.magnifierZoom / 100.0;
     const int border = std::max(2, static_cast<int>(std::lround(3 * scale_)));
-    const int sourceSize = std::max(8, static_cast<int>(std::lround((size - border) / zoom)));
     const int rootWidth = DisplayWidth(display_, screen_), rootHeight = DisplayHeight(display_, screen_);
+    // The part of the pointer's monitor that is on the screen.
+    const int left = std::max(0, monitor->x), top = std::max(0, monitor->y);
+    const int right = std::min(rootWidth, monitor->x + monitor->width), bottom = std::min(rootHeight, monitor->y + monitor->height);
+    if (right - left < 8 || bottom - top < 8) { HideLens(); return; }
+    // The source square never exceeds that area: a lens larger than the
+    // monitor allows shows all of it, magnified a little more than the chosen
+    // zoom, instead of reading a neighbouring monitor.
+    const int sourceSize = std::clamp(static_cast<int>(std::lround((size - border) / zoom)), 8, std::min(right - left, bottom - top));
+    const double magnification = double(size - border) / sourceSize;
     // Source square around the pointer, kept inside the monitor and the screen.
-    const int sx = std::clamp(pointerX_ - sourceSize / 2, std::max(0, monitor->x), std::max(0, std::min(rootWidth, monitor->x + monitor->width) - sourceSize));
-    const int sy = std::clamp(pointerY_ - sourceSize / 2, std::max(0, monitor->y), std::max(0, std::min(rootHeight, monitor->y + monitor->height) - sourceSize));
-    if (sx + sourceSize > rootWidth || sy + sourceSize > rootHeight) { HideLens(); return; }
+    const int sx = std::clamp(pointerX_ - sourceSize / 2, left, right - sourceSize);
+    const int sy = std::clamp(pointerY_ - sourceSize / 2, top, bottom - sourceSize);
     // The lens sits beside the pointer and must never cover its own source:
     // the screen read below includes every window, this one too.
     int offset = size * 3 / 4, cx = 0, cy = 0;
@@ -1190,7 +1352,7 @@ void X11Engine::PaintLens(TimePoint now) {
     };
     cairo_save(cr);
     shape(); cairo_clip(cr);
-    cairo_translate(cr, inset, inset); cairo_scale(cr, zoom, zoom);
+    cairo_translate(cr, inset, inset); cairo_scale(cr, magnification, magnification);
     cairo_set_source_surface(cr, capture, 0, 0);
     cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
     cairo_paint(cr);
@@ -1211,7 +1373,8 @@ void X11Engine::PaintLens(TimePoint now) {
     cairo_destroy(cr); cairo_surface_destroy(capture); XDestroyImage(image); cairo_surface_flush(lens_.surface);
     if (!ok) { GraphicsError("Could not draw the magnifier."); return; }
     Place(lens_, cx - size / 2, cy - size / 2);
-    lensVisible_ = true;
+    lensVisible_ = true; lensDirty_ = false;
+    lensX_ = pointerX_; lensY_ = pointerY_; lensPressed_ = pressed_;
     nextLensFrame_ = now + kLensInterval;
 }
 void X11Engine::RawButton(int device, unsigned button, bool down) {
@@ -1256,12 +1419,17 @@ bool X11Engine::SelectInput() {
         {XIAllDevices, static_cast<int>(hierarchy.size()), hierarchy.data()}}};
     keyboardSelected_ = keys;
     keyboardReleases_ = settings_.keyDisplayEnabled;
+    if (!keys) lastKey_ = {}; // Without observed keys there is no typing hold.
     return XISelectEvents(display_, root_, masks.data(), masks.size()) == Success;
 }
 void X11Engine::RawKey(const XIRawEvent* raw, bool pressed) {
     const bool repeat = (raw->flags & XIKeyRepeat) != 0;
     const KeySym symbol = XkbKeycodeToKeysym(display_, static_cast<KeyCode>(std::clamp(raw->detail, 0, 255)), 0, 0);
-    if (pressed && !repeat && allowed_ && settings_.keyboardSoundsEnabled) {
+    // Only the time is kept: it tells a pointer hidden by typing from one
+    // hidden for any other reason, and holds the spotlight and lens meanwhile.
+    if (pressed) lastKey_ = Clock::now();
+    // A hidden pointer does not pause typing sounds; every other rule does.
+    if (pressed && !repeat && RulesAllowKeys() && settings_.keyboardSoundsEnabled) {
         unsigned category = kKeyGeneric;
         if (symbol == XK_space) category = kKeySpace;
         else if (symbol == XK_Return || symbol == XK_KP_Enter) category = kKeyEnter;
@@ -1362,22 +1530,28 @@ void X11Engine::Place(Overlay& overlay, int x, int y) {
 void X11Engine::PaintHighlight(TimePoint now) {
     const int style = settings_.highlightStyle;
     const bool spotlight = style == kHighlightSpotlight;
-    double radius = (spotlight ? settings_.spotlightRadius : settings_.highlightRadius) * scale_;
+    const double nominal = (spotlight ? settings_.spotlightRadius : settings_.highlightRadius) * scale_;
+    double radius = nominal;
     double opacity = settings_.highlightOpacity / 100.0;
-    if (settings_.highlightBreathing && !spotlight) {
-        // A slow 2.6 s swell. The overlay is repainted every frame while breathing.
+    const bool breathing = settings_.highlightBreathing && !spotlight;
+    if (breathing) {
+        // A slow 2.6 s swell, redrawn about 30 times a second whatever the
+        // frame limit (as on Windows). It only shrinks from the nominal size.
         const double phase = std::sin(Seconds(now) * 2 * kPi / 2.6);
         radius *= 0.92 + 0.08 * phase;
         opacity *= 0.76 + 0.24 * phase;
-        highlightDirty_ = true;
+        if (now >= nextBreathFrame_) highlightDirty_ = true;
     }
     if (spotlight) { Hide(highlight_); PaintSpotlight(); return; }
-    const double extent = style == kHighlightCrosshair ? radius * 1.75 : style == kHighlightGlow ? radius * 1.4 : radius;
-    const int size = static_cast<int>(std::ceil(extent * 2 + 8));
+    const auto extentOf = [style](double r) { return style == kHighlightCrosshair ? r * 1.75 : style == kHighlightGlow ? r * 1.4 : r; };
+    const double extent = extentOf(radius);
+    // The window keeps the nominal size, so breathing never resizes it.
+    const int size = static_cast<int>(std::ceil(extentOf(nominal) * 2 + 8));
     if (!EnsureOverlay(highlight_, size, size, "highlight")) return;
     if (!highlight_.mapped) highlightDirty_ = true;
     Place(highlight_, pointerX_ - size / 2, pointerY_ - size / 2);
     if (highlightDirty_) {
+        if (breathing) nextBreathFrame_ = now + kBreathInterval;
         cairo_t* cr = cairo_create(highlight_.surface);
         cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE); cairo_set_source_rgba(cr, 0, 0, 0, 0); cairo_paint(cr);
         cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
@@ -1650,7 +1824,7 @@ void X11Engine::RepairStacking() {
     const bool reorder = stackOrderDirty_, inspectForeign = foreignStackDirty_;
     stackOrderDirty_ = foreignStackDirty_ = false;
     bool repair = false;
-    if ((!allowed_ && !keyVisible_) || !compositor_ || !visual_ || graphicsFailed_) return;
+    if ((!allowed_ && !keyVisible_ && !typingHold_) || !compositor_ || !visual_ || graphicsFailed_) return;
     // Collect a fixed, bottom-to-top ordering. The real cursor replacement is
     // always highest; no window takes focus or accepts pointer input.
     std::array<Overlay*, kTrailCount + kParticleCount + 8> overlays{};
@@ -1712,7 +1886,7 @@ void X11Engine::Render(TimePoint now) {
     if (!allowed_) {
         // A held lens keeps showing live content at its resting rate.
         if (typingHold_ && settings_.magnifierEnabled && lensVisible_) {
-            if (now >= nextLensFrame_) PaintLens(now);
+            if (now >= nextLensFrame_ || lensDirty_) PaintLens(now);
             if (lensVisible_ && (!frameScheduled_ || nextLensFrame_ < nextFrame_)) { nextFrame_ = nextLensFrame_; frameScheduled_ = true; }
         } else HideLens();
         scheduleKeys(); XFlush(display_); return;
@@ -1728,9 +1902,15 @@ void X11Engine::Render(TimePoint now) {
         now - lastMotion_ >= std::chrono::milliseconds(settings_.highlightIdleHideMs);
     const bool highlightShown = settings_.highlightEnabled && !idleHidden;
     if (highlightShown) PaintHighlight(now); else { Hide(highlight_); HideSpotlight(); }
-    if (settings_.magnifierEnabled) PaintLens(now); else HideLens();
+    // Each lens frame reads the screen back, so it runs only when the pointer,
+    // its artwork or the settings changed, or kLensInterval passed; never at
+    // the rate of other animations.
+    if (!settings_.magnifierEnabled) HideLens();
+    else if (!lensVisible_ || lensDirty_ || pointerX_ != lensX_ || pointerY_ != lensY_ || pressed_ != lensPressed_ || now >= nextLensFrame_)
+        PaintLens(now);
     UpdateCursorEffect(Seconds(now));
-    bool animating = highlightShown && highlight_.mapped && settings_.highlightBreathing && settings_.highlightStyle != kHighlightSpotlight;
+    const bool breathing = highlightShown && highlight_.mapped && settings_.highlightBreathing && settings_.highlightStyle != kHighlightSpotlight;
+    bool animating = false;
     for (auto& trail : trails_) if (trail.active) {
         const double elapsed = std::chrono::duration<double, std::milli>(now - trail.started).count();
         const double progress = std::clamp(elapsed / settings_.trailDurationMs, 0.0, 1.0);
@@ -1762,6 +1942,11 @@ void X11Engine::Render(TimePoint now) {
     nextPointerFrame_ = now + std::chrono::nanoseconds(1000000000ull / pointerRate);
     frameScheduled_ = !graphicsFailed_ && (animating || trailMotionPending_);
     if (frameScheduled_) nextFrame_ = nextEffectsFrame_;
+    if (breathing && !graphicsFailed_) {
+        // Breathing has its own deadline and never runs effect frames.
+        if (!frameScheduled_ || nextBreathFrame_ < nextFrame_) nextFrame_ = nextBreathFrame_;
+        frameScheduled_ = true;
+    }
     if (highlightShown && settings_.highlightIdleHideMs > 0) {
         // One extra pass at the idle deadline hides the halo; motion reschedules it.
         const auto hideAt = lastMotion_ + std::chrono::milliseconds(settings_.highlightIdleHideMs);
@@ -1805,7 +1990,7 @@ void X11Engine::Commands() {
     if (restorePending_.exchange(false, std::memory_order_acquire)) {
         settings_.enabled = false;
         { std::lock_guard<std::mutex> lock(mutex_); pending_.enabled = false; }
-        held_ = 0; devices_.clear(); ClearEffects(); audio_.SetAllowed(false); allowed_ = false; Publish();
+        held_ = 0; devices_.clear(); typingHold_ = false; ClearEffects(); audio_.SetAllowed(false); allowed_ = false; Publish();
     }
     if (settingsPending_.exchange(false, std::memory_order_acquire)) {
         Settings next; { std::lock_guard<std::mutex> lock(mutex_); next = pending_; }
@@ -1825,7 +2010,7 @@ void X11Engine::Commands() {
             spotlight_.painted = false;
             if (!(next.highlightEnabled && next.highlightStyle == kHighlightSpotlight)) ResetSpotlight();
             trailMotionPending_ = trailAnchorSet_ = false;
-            highlightDirty_ = keyDirty_ = true; graphicsFailed_ = false; graphicsError_.clear(); lensError_.clear();
+            highlightDirty_ = keyDirty_ = lensDirty_ = true; graphicsFailed_ = false; graphicsError_.clear(); lensError_.clear();
             if (!next.keyDisplayEnabled) HideKeys();
             if (!next.magnifierEnabled) HideLens();
         }
@@ -1839,7 +2024,8 @@ void X11Engine::Commands() {
         if (shakeChanged) {
             shake_.Configure(settings_.shakeStyle, settings_.shakeSensitivity, settings_.shakeMaximumScale);
             shakeMotionPending_ = false;
-            if (shakeCacheChanged) RebuildShakeCache();
+            // Rebuilt when the next shake starts.
+            if (shakeCacheChanged) { ClearShakeCache(); shakeError_.clear(); }
         }
         if (rulesChanged) {
             exclusions_ = ParseExclusions(settings_.excludedProcesses); allowances_ = ParseExclusions(settings_.allowedProcesses);
@@ -1887,17 +2073,27 @@ void X11Engine::ProcessEvent(XEvent& event) {
     if (event.type == MapNotify && event.xmap.event == root_) stacked = event.xmap.window;
     else if (event.type == ConfigureNotify && event.xconfigure.event == root_) stacked = event.xconfigure.window;
     else if (event.type == CirculateNotify && event.xcirculate.event == root_) stacked = event.xcirculate.window;
-    if (stacked && !OwnOverlay(stacked) && allowed_) stackDirty_ = foreignStackDirty_ = true;
-    if (event.type == PropertyNotify && (event.xproperty.window == root_ || event.xproperty.window == foreground_)) {
-        if (event.xproperty.atom == activeAtom_ || event.xproperty.atom == wmStateAtom_ || event.xproperty.atom == typeAtom_ || event.xproperty.atom == pidAtom_ || event.xproperty.atom == frameExtentsAtom_)
-            UpdateForeground(event.xproperty.atom == pidAtom_);
-    } else if ((event.type == ConfigureNotify || event.type == DestroyNotify || event.type == FocusOut || event.type == FocusIn) && event.xany.window == foreground_) {
+    if (stacked && !OwnOverlay(stacked) && (allowed_ || typingHold_ || keyVisible_)) stackDirty_ = foreignStackDirty_ = true;
+    if (event.type == PropertyNotify && event.xproperty.window == root_ && event.xproperty.atom == XA_RESOURCE_MANAGER) {
+        RefreshScale();
+    } else if (event.type == PropertyNotify && (event.xproperty.window == root_ || event.xproperty.window == foreground_)) {
+        const Atom atom = event.xproperty.atom;
+        // A new PID or window class can turn the same window into a game.
+        const bool identity = atom == pidAtom_ || atom == XA_WM_CLASS;
+        if (atom == activeAtom_ || atom == wmStateAtom_ || atom == typeAtom_ || atom == frameExtentsAtom_ || identity)
+            UpdateForeground(identity);
+    } else if (event.type == ConfigureNotify && event.xany.window == foreground_) {
+        // A drag or resize sends one per motion step: re-read the window once
+        // the first of them is kGeometryDelay old, as Windows does.
+        if (!foregroundGeometryPending_) { foregroundGeometryPending_ = true; foregroundGeometryDue_ = Clock::now() + kGeometryDelay; }
+    } else if ((event.type == DestroyNotify || event.type == FocusOut || event.type == FocusIn) && event.xany.window == foreground_) {
         UpdateForeground();
     } else if (event.type == Expose) {
         if (event.xexpose.window == highlight_.window) highlightDirty_ = true;
         if (event.xexpose.window == cursor_.window) cursorDirty_ = true;
         if (event.xexpose.window == keyPanel_.window) { keyDirty_ = true; ScheduleKeyFrame(); }
         if (event.xexpose.window == spotlight_.window) spotlight_.painted = false;
+        if (event.xexpose.window == lens_.window) { lensDirty_ = true; ScheduleHeldLens(); }
         ScheduleFrame(true);
     }
 }
@@ -1912,15 +2108,13 @@ void X11Engine::Publish() {
     if (!settings_.enabled) next.stateText = "Paused — your normal cursor is restored.";
     else if (locked_.load(std::memory_order_relaxed)) next.stateText = "Paused while the session is locked.";
     else if (foregroundExcluded_) next.stateText = "Paused in excluded application " + foregroundName_ + ".";
-    else if (FullscreenPaused()) next.stateText = "Paused in the fullscreen application.";
-    else if (!cursorVisible_) next.stateText = "Paused for a fully transparent application cursor.";
+    else if (FullscreenPaused()) next.stateText = "Paused in the fullscreen game.";
+    else if (!cursorVisible_) next.stateText = typingHold_ ? "Paused while you type; the spotlight and the magnifier stay in place."
+        : "Paused for a fully transparent application cursor.";
     else if (!compositor_) next.stateText = "Listening — visual effects require an active X11 compositing manager.";
     else if (graphicsFailed_) next.stateText = "Visual effects paused after a graphics error; sound input remains active.";
     else if (pressed_) next.stateText = settings_.cursorHold ? "Pressed cursor is active while the selected button is held." : "Pressed cursor pulse is active.";
     else next.stateText = "Ready — X11 cursor inversion, highlights, trails, click effects, magnifier and key display.";
-    next.capabilities = "XInput2 global mouse events; current-cursor inversion through a small software overlay; hold or timed pulse; optional Plasma-style/macOS-inspired shake enlargement of cached native cursor pixels; filled/ring/glow/crosshair/spotlight highlights with optional breathing and idle hide; optional bounded dot/ring/sparkle/comet/fine-sparkle trails; ring/pulse/ripple/burst/neon/target left, right and middle click effects; a magnifier lens beside the pointer refreshed from the screen about 30 times a second; an on-screen key display; adaptive/manual frame pacing; fullscreen pause with executable/WM_CLASS allowlist and exclusions; PCM/float WAV click and keyboard sounds through PulseAudio or PipeWire. "
-        "Keyboard input is subscribed only while keyboard sounds or the key display are switched on. Sounds reduce each press to a coarse category (key, space, enter, backspace); the key display keeps a label only while it is on screen. Nothing is recorded. "
-        "Cursor overlays require a compositing manager and follow compositor timing, not hardware-cursor timing. The spotlight dims the pointer's monitor only; the lens always sits beside the pointer because a centered lens would capture itself. Alternate profiles, reverse, custom cursor files and cursor-size changes are not supported on X11. General pointer confinement and XFixes-hidden cursor state cannot be queried; use fullscreen pause and explicit game exclusions. Common ScreenSaver D-Bus lock signals are honored. No Xwayland global-input fallback.";
     next.lastError = graphicsError_;
     if (!shakeError_.empty()) next.lastError += (next.lastError.empty() ? "" : "\n") + shakeError_;
     if (!lensError_.empty()) next.lastError += (next.lastError.empty() ? "" : "\n") + lensError_;
@@ -1979,6 +2173,9 @@ void X11Engine::Run() noexcept {
             ObserveShake();
             const auto now = Clock::now();
             if (pointerDirty_ && now - lastRuleCheck_ >= kSafetyInterval) UpdateForeground();
+            if (foregroundGeometryPending_ && now >= foregroundGeometryDue_) UpdateForeground();
+            // Typing stopped: the held spotlight and lens leave as well.
+            if (typingHold_ && now >= lastKey_ + kTypingHold) ApplyPolicy();
             if (pulse_ && now >= pulseDeadline_) { pulse_ = false; ApplyPolicy(); }
             if (held_ && now >= nextSafety_) ReconcileButtons();
             if (frameScheduled_ && now >= nextFrame_) Render(now);
@@ -1995,6 +2192,8 @@ void X11Engine::Run() noexcept {
             if (frameScheduled_) before(nextFrame_);
             if (held_) before(nextSafety_);
             if (pulse_) before(pulseDeadline_);
+            if (foregroundGeometryPending_) before(foregroundGeometryDue_);
+            if (typingHold_) before(lastKey_ + kTypingHold);
             std::array<pollfd, 2> watched{{{ConnectionNumber(display_), POLLIN, 0}, {wake_, POLLIN, 0}}};
             timespec delay{};
             if (timeout >= 0) { delay.tv_sec = timeout / 1000000000; delay.tv_nsec = timeout % 1000000000; }

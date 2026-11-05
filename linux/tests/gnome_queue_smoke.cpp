@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 
 using namespace clickshade::linuxapp;
@@ -31,6 +32,8 @@ class FakeShell {
 public:
     std::atomic<unsigned> statusCalls{0}, reloadCalls{0}, deactivateCalls{0};
     std::atomic<bool> active{false};
+    // Extensions after 1.0 drop the unused capability text from GetStatus.
+    explicit FakeShell(bool shortStatus = false) : shortStatus_(shortStatus) {}
 
     bool Start(const char* address) {
         address_ = address;
@@ -70,6 +73,7 @@ public:
     ~FakeShell() { Stop(); }
 
 private:
+    bool shortStatus_ = false;
     std::string address_;
     std::thread worker_;
     std::mutex mutex_;
@@ -92,8 +96,9 @@ private:
                     self.blocked_ = false;
                 }
             }
-            g_dbus_method_invocation_return_value(invocation, g_variant_new("(bbsss)",
-                self.active.load(), TRUE, "Mock bridge ready", "", "Mock transport only"));
+            g_dbus_method_invocation_return_value(invocation, self.shortStatus_
+                ? g_variant_new("(bbss)", self.active.load(), TRUE, "Mock bridge ready", "")
+                : g_variant_new("(bbsss)", self.active.load(), TRUE, "Mock bridge ready", "", "Mock transport only"));
             return;
         }
         if (g_str_equal(method, "SetActive")) {
@@ -106,19 +111,19 @@ private:
         g_dbus_method_invocation_return_value(invocation, nullptr);
     }
     void Run() {
-        constexpr const char* xml = R"XML(<node><interface name="org.gnome.Shell.Extensions.ClickShade1">
+        const std::string xml = std::string(R"XML(<node><interface name="org.gnome.Shell.Extensions.ClickShade1">
           <method name="Reload"/><method name="Restore"/>
           <method name="SetActive"><arg type="b" direction="in"/></method>
           <method name="GetStatus"><arg type="b" direction="out"/><arg type="b" direction="out"/>
-            <arg type="s" direction="out"/><arg type="s" direction="out"/><arg type="s" direction="out"/></method>
-        </interface></node>)XML";
+            <arg type="s" direction="out"/><arg type="s" direction="out"/>)XML") +
+            (shortStatus_ ? "" : R"XML(<arg type="s" direction="out"/>)XML") + "</method></interface></node>";
         GMainContext* context = g_main_context_new();
         g_main_context_push_thread_default(context);
         GError* error = nullptr;
         GDBusConnection* connection = g_dbus_connection_new_for_address_sync(address_.c_str(),
             static_cast<GDBusConnectionFlags>(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
                 G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION), nullptr, nullptr, &error);
-        GDBusNodeInfo* info = g_dbus_node_info_new_for_xml(xml, nullptr);
+        GDBusNodeInfo* info = g_dbus_node_info_new_for_xml(xml.c_str(), nullptr);
         guint registration = 0;
         if (connection) {
             GVariant* answer = g_dbus_connection_call_sync(connection, "org.freedesktop.DBus",
@@ -195,11 +200,30 @@ int main() {
 
     Check(engine->Start(settings, error) && Until([&] { return engine->Status().running && shell.active.load(); }),
         "restart discards stale queued wake state and activates normally");
+    // The master switch reaches the Shell through SetActive at once; the
+    // saved settings file follows later.
+    settings.enabled = false; engine->Update(settings);
+    Check(Until([&] { return !shell.active.load(); }, 500), "turning the master switch off deactivates the Shell at once");
+    settings.enabled = true; engine->Update(settings);
+    Check(Until([&] { return shell.active.load(); }), "turning the master switch on activates the Shell again");
     engine->Restore();
+    settings.enabled = false; engine->Update(settings); // The app saves the switch right after Restore.
     Check(Until([&] { return !shell.active.load(); }), "explicit Restore remains deliverable after restart");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Check(!shell.active.load(), "the settings update that follows Restore does not reactivate the Shell");
     engine->Stop(); engine->Stop(); engine.reset();
     Check(!shell.active.load(), "repeated Stop leaves no active service state");
     shell.Stop();
+
+    FakeShell current(true);
+    Check(current.Start(g_test_dbus_get_bus_address(bus)), "a mock Shell without the capability text starts");
+    engine = CreateGnomeWaylandEngine(); settings.enabled = true;
+    Check(engine->Start(settings, error) && Until([&] {
+        const auto status = engine->Status();
+        return status.running && status.stateText == "Mock bridge ready" && current.active.load();
+    }), "a status without the capability text is accepted");
+    engine->Stop(); engine.reset();
+    current.Stop();
     g_test_dbus_down(bus);
     g_object_unref(bus);
     std::printf("\nGNOME bridge queue/lifecycle: %u passed, %u failed.\n", passed, failed);

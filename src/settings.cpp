@@ -2,6 +2,7 @@
 #include "hotkeys.h"
 #define SECURITY_WIN32
 #include <security.h>
+#include <sddl.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <taskschd.h>
@@ -9,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cwchar>
 #include <map>
 #include <set>
 #include <vector>
@@ -19,6 +21,10 @@ constexpr int kSettingsVersion = 2;
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"ClickShade";
 constexpr wchar_t kTaskName[] = L"ClickShade";
+// Task Scheduler defaults to 7, below normal, which lets games and video
+// starve the overlays and the pressed-cursor swap. 4 is its first normal level.
+constexpr int kTaskPriority = 4;
+constexpr int kLowestNormalTaskPriority = 6;
 constexpr wchar_t kPortableMarker[] = L"ClickShade.portable";
 // Preview-build defaults. A saved file that still carries exactly these values
 // was never customized, so the upgrade moves it to the neon defaults.
@@ -86,10 +92,13 @@ std::wstring SettingsPath() {
     return directory.empty() ? std::wstring() : directory + L"\\settings.ini";
 }
 
-std::wstring CrashReportDirectory() {
+std::wstring CrashReportPath() {
     const auto directory = SettingsDirectory();
-    if (directory.empty()) return {};
-    const auto reports = directory + L"\\crash-reports";
+    return directory.empty() ? std::wstring() : directory + L"\\crash-reports";
+}
+
+std::wstring CrashReportDirectory() {
+    const auto reports = CrashReportPath();
     return EnsureDirectory(reports) ? reports : std::wstring();
 }
 
@@ -104,13 +113,14 @@ bool IsProcessElevated() noexcept {
     return elevated;
 }
 
-bool RelaunchElevated(std::wstring& error) {
+bool RelaunchElevated(std::wstring& error, const std::wstring& extraArguments) {
     error.clear();
     const auto exe = ExecutablePath();
     if (exe.empty()) { error = L"Could not locate ClickShade.exe."; return false; }
     // The new instance waits for this process to exit before claiming the
     // single-instance lock, so a settings-window handoff feels like a restart.
-    const std::wstring arguments = L"--replace " + std::to_wstring(GetCurrentProcessId());
+    std::wstring arguments = L"--replace " + std::to_wstring(GetCurrentProcessId());
+    if (!extraArguments.empty()) arguments += L" " + extraArguments;
     SHELLEXECUTEINFOW info{};
     info.cbSize = sizeof(info);
     info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
@@ -187,9 +197,11 @@ bool OpenTaskFolder(Apartment& apartment, Com<ITaskService>& service, Com<ITaskF
 }
 
 // Returns true when a ClickShade task exists; matches reports whether its
-// action launches this executable.
-bool QueryScheduledTask(bool& matches) {
+// action launches this executable, priority (when given) its priority level
+// and target (when given) the executable it launches.
+bool QueryScheduledTask(bool& matches, int* priority = nullptr, std::wstring* target = nullptr) {
     matches = false;
+    if (target) target->clear();
     Apartment apartment;
     Com<ITaskService> service; Com<ITaskFolder> folder; std::wstring error;
     if (!OpenTaskFolder(apartment, service, folder, error)) return false;
@@ -197,17 +209,35 @@ bool QueryScheduledTask(bool& matches) {
     Com<IRegisteredTask> task;
     if (FAILED(folder->GetTask(name.value, task.Put())) || !task) return false;
     Com<ITaskDefinition> definition;
+    if (FAILED(task->get_Definition(definition.Put())) || !definition) return true;
+    Com<ITaskSettings> taskSettings;
+    if (priority && SUCCEEDED(definition->get_Settings(taskSettings.Put())) && taskSettings)
+        taskSettings->get_Priority(priority);
     Com<IActionCollection> actions;
-    if (SUCCEEDED(task->get_Definition(definition.Put())) && definition &&
-        SUCCEEDED(definition->get_Actions(actions.Put())) && actions) {
+    if (SUCCEEDED(definition->get_Actions(actions.Put())) && actions) {
         Com<IAction> action;
         if (SUCCEEDED(actions->get_Item(1, action.Put())) && action) {
             Com<IExecAction> exec;
             if (SUCCEEDED(action->QueryInterface(kIidExecAction, reinterpret_cast<void**>(exec.Put()))) && exec) {
                 BSTR path = nullptr;
                 if (SUCCEEDED(exec->get_Path(&path)) && path) {
-                    matches = _wcsicmp(path, ExecutablePath().c_str()) == 0;
+                    // Stored as typed: it may be quoted or use variables
+                    // such as %ProgramFiles%.
+                    std::wstring stored = path;
                     SysFreeString(path);
+                    if (stored.size() >= 2 && stored.front() == L'"' && stored.back() == L'"') stored = stored.substr(1, stored.size() - 2);
+                    std::vector<wchar_t> expanded(32768);
+                    const DWORD length = ExpandEnvironmentStringsW(stored.c_str(), expanded.data(), static_cast<DWORD>(expanded.size()));
+                    if (length && length <= expanded.size()) stored.assign(expanded.data());
+                    matches = _wcsicmp(stored.c_str(), ExecutablePath().c_str()) == 0;
+                    if (!matches) {
+                        // The same file under another spelling (8.3 names).
+                        std::vector<wchar_t> a(32768), b(32768);
+                        const DWORD la = GetLongPathNameW(stored.c_str(), a.data(), static_cast<DWORD>(a.size()));
+                        const DWORD lb = GetLongPathNameW(ExecutablePath().c_str(), b.data(), static_cast<DWORD>(b.size()));
+                        matches = la && lb && la < a.size() && lb < b.size() && _wcsicmp(a.data(), b.data()) == 0;
+                    }
+                    if (target) *target = stored;
                 }
             }
         }
@@ -222,7 +252,181 @@ std::wstring CurrentUserName() {
     return {};
 }
 
+// Rights that let a program change what an elevated start runs: rewrite or
+// replace a file, add or remove entries in a folder, or rewrite permissions.
+constexpr DWORD kChangeFileRights = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+                                    DELETE | WRITE_DAC | WRITE_OWNER;
+constexpr DWORD kChangeFolderRights = kChangeFileRights | FILE_DELETE_CHILD;
+// Higher folders only matter when they let a folder below be renamed or
+// replaced; creating new entries beside it is harmless (C:\ allows that).
+constexpr DWORD kReplaceBelowRights = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER;
+constexpr wchar_t kTrustedInstallerSid[] = L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+// The user's own token without administrator rights: the linked token of an
+// elevated split-token process, otherwise the process token with the
+// Administrators group reduced to deny-only (UAC off, or not elevated).
+HANDLE StandardUserToken() {
+    HANDLE process = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &process)) return nullptr;
+    HANDLE result = nullptr;
+    TOKEN_ELEVATION_TYPE type = TokenElevationTypeDefault;
+    DWORD returned = 0;
+    if (GetTokenInformation(process, TokenElevationType, &type, sizeof(type), &returned) && type == TokenElevationTypeFull) {
+        TOKEN_LINKED_TOKEN linked{};
+        if (GetTokenInformation(process, TokenLinkedToken, &linked, sizeof(linked), &returned)) result = linked.LinkedToken;
+    } else {
+        BYTE administrators[SECURITY_MAX_SID_SIZE]{};
+        DWORD size = sizeof(administrators);
+        HANDLE restricted = nullptr;
+        SID_AND_ATTRIBUTES denyOnly{administrators, 0};
+        if (CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, administrators, &size) &&
+            CreateRestrictedToken(process, DISABLE_MAX_PRIVILEGE, 1, &denyOnly, 0, nullptr, 0, nullptr, &restricted)) {
+            // AccessCheck takes an impersonation token.
+            if (!DuplicateToken(restricted, SecurityIdentification, &result)) result = nullptr;
+            CloseHandle(restricted);
+        }
+    }
+    CloseHandle(process);
+    return result;
+}
+
+// An owner can always rewrite the permissions, so only system owners count.
+bool TrustedOwner(PSID owner) {
+    for (const auto type : {WinBuiltinAdministratorsSid, WinLocalSystemSid}) {
+        BYTE sid[SECURITY_MAX_SID_SIZE]{};
+        DWORD size = sizeof(sid);
+        if (CreateWellKnownSid(type, nullptr, sid, &size) && EqualSid(sid, owner)) return true;
+    }
+    PSID installer = nullptr;
+    if (!ConvertStringSidToSidW(kTrustedInstallerSid, &installer)) return false;
+    const bool trusted = EqualSid(installer, owner) != FALSE;
+    LocalFree(installer);
+    return trusted;
+}
+
+bool SidIs(PSID sid, const wchar_t* text) {
+    PSID known = nullptr;
+    if (!ConvertStringSidToSidW(text, &known)) return false;
+    const bool same = EqualSid(known, sid) != FALSE;
+    LocalFree(known);
+    return same;
+}
+
+// True when an entry of the permissions lets anyone but Administrators,
+// SYSTEM, TrustedInstaller or the (already trusted) owner change the object
+// in one of the given ways: another account or group counts as well as this
+// user. Entries that only apply to objects created below are skipped, deny
+// entries are ignored (which can only make the answer stricter), and any
+// entry this check cannot read counts as a change right.
+bool OtherPrincipalCanChange(PSECURITY_DESCRIPTOR descriptor, DWORD rights) {
+    BOOL present = FALSE, defaulted = FALSE;
+    PACL dacl = nullptr;
+    if (!GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted)) return true;
+    if (!present || !dacl) return true; // No DACL: everyone has full access.
+    ACL_SIZE_INFORMATION information{};
+    if (!GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation)) return true;
+    GENERIC_MAPPING mapping{FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
+    for (DWORD index = 0; index < information.AceCount; ++index) {
+        void* entry = nullptr;
+        if (!GetAce(dacl, index, &entry) || !entry) return true;
+        const auto* header = static_cast<const ACE_HEADER*>(entry);
+        if (header->AceFlags & INHERIT_ONLY_ACE) continue;
+        if (header->AceType == ACCESS_DENIED_ACE_TYPE || header->AceType == ACCESS_DENIED_CALLBACK_ACE_TYPE ||
+            header->AceType == ACCESS_DENIED_OBJECT_ACE_TYPE || header->AceType == ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE)
+            continue;
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE && header->AceType != ACCESS_ALLOWED_CALLBACK_ACE_TYPE) {
+            // Object entries (rare on files) have another layout: assume the worst.
+            if (header->AceType == ACCESS_ALLOWED_OBJECT_ACE_TYPE || header->AceType == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE ||
+                header->AceType == ACCESS_ALLOWED_COMPOUND_ACE_TYPE) return true;
+            continue; // Audit and alarm entries grant nothing.
+        }
+        // ACCESS_ALLOWED_CALLBACK_ACE shares the ACCESS_ALLOWED_ACE layout.
+        const auto* allowed = static_cast<const ACCESS_ALLOWED_ACE*>(entry);
+        ACCESS_MASK mask = allowed->Mask;
+        MapGenericMask(&mask, &mapping);
+        if (!(mask & rights)) continue;
+        PSID sid = const_cast<DWORD*>(&allowed->SidStart);
+        if (!IsValidSid(sid)) return true;
+        // CREATOR OWNER and OWNER RIGHTS stand for the owner, checked above.
+        if (TrustedOwner(sid) || SidIs(sid, L"S-1-3-0") || SidIs(sid, L"S-1-3-4")) continue;
+        return true;
+    }
+    return false;
+}
+
+// True when someone without administrator rights may change the file or
+// folder at path in any of the given ways: the standard-user token of this
+// account, or any other account or group the permissions name. Anything that
+// cannot be read counts as changeable.
+bool StandardUserCanChange(HANDLE token, const std::wstring& path, DWORD rights) {
+    const SECURITY_INFORMATION parts = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                                       DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+    DWORD needed = 0;
+    GetFileSecurityW(path.c_str(), parts, nullptr, 0, &needed);
+    if (!needed) return true;
+    std::vector<BYTE> descriptor(needed);
+    if (!GetFileSecurityW(path.c_str(), parts, descriptor.data(), needed, &needed)) return true;
+    PSID owner = nullptr;
+    BOOL defaulted = FALSE;
+    if (!GetSecurityDescriptorOwner(descriptor.data(), &owner, &defaulted) || !owner || !TrustedOwner(owner)) return true;
+    if (OtherPrincipalCanChange(descriptor.data(), rights)) return true;
+    GENERIC_MAPPING mapping{FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
+    struct { PRIVILEGE_SET set; LUID_AND_ATTRIBUTES more[15]; } privileges{};
+    DWORD privilegeBytes = sizeof(privileges), granted = 0;
+    BOOL accessible = FALSE;
+    if (!AccessCheck(descriptor.data(), token, MAXIMUM_ALLOWED, &mapping, &privileges.set, &privilegeBytes,
+                     &granted, &accessible)) return true;
+    return accessible && (granted & rights) != 0;
+}
+
+// True when the path is exactly what the file system resolves it to, so no
+// junction, symbolic link or substituted drive can be retargeted later.
+bool PathHasNoLinks(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    std::vector<wchar_t> resolved(32768), expanded(32768);
+    const DWORD resolvedLength = GetFinalPathNameByHandleW(file, resolved.data(), static_cast<DWORD>(resolved.size()),
+                                                           FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(file);
+    const DWORD expandedLength = GetLongPathNameW(path.c_str(), expanded.data(), static_cast<DWORD>(expanded.size()));
+    if (!resolvedLength || resolvedLength >= resolved.size() || !expandedLength || expandedLength >= expanded.size()) return false;
+    const wchar_t* target = resolved.data();
+    if (std::wcsncmp(target, L"\\\\?\\", 4) == 0) target += 4;
+    return CompareStringOrdinal(target, -1, expanded.data(), static_cast<int>(expandedLength), TRUE) == CSTR_EQUAL;
+}
+
+bool LocationProtected(std::wstring path) {
+    if (path.rfind(L"\\\\?\\", 0) == 0 && path.size() > 6 && path[5] == L':') path.erase(0, 4);
+    // Only a fixed local drive: on a share or a removable drive another
+    // computer, or an offline copy, decides what the file contains.
+    if (path.size() < 4 || path[1] != L':' || path[2] != L'\\') return false;
+    const std::wstring root = path.substr(0, 3);
+    if (GetDriveTypeW(root.c_str()) != DRIVE_FIXED || !PathHasNoLinks(path)) return false;
+    HANDLE token = StandardUserToken();
+    if (!token) return false;
+    // The file, its folder (where Windows also looks for DLLs), then every
+    // parent folder up to the drive root.
+    bool protectedPath = !StandardUserCanChange(token, path, kChangeFileRights);
+    DWORD rights = kChangeFolderRights;
+    while (protectedPath && path.size() > root.size()) {
+        const auto separator = path.find_last_of(L'\\');
+        path = separator <= 2 ? root : path.substr(0, separator);
+        protectedPath = !StandardUserCanChange(token, path, rights);
+        rights = kReplaceBelowRights;
+    }
+    CloseHandle(token);
+    return protectedPath;
+}
+
 bool CreateScheduledTask(std::wstring& error) {
+    // The task starts this file elevated without a prompt, so a location that
+    // programs without administrator rights can change is refused.
+    if (!ExecutableLocationProtected()) {
+        error = L"ClickShade.exe is in a folder that programs without administrator rights can change, so it cannot "
+                L"start elevated without a prompt. Copy the ClickShade folder into Program Files first.";
+        return false;
+    }
     Apartment apartment;
     Com<ITaskService> service; Com<ITaskFolder> folder;
     if (!OpenTaskFolder(apartment, service, folder, error)) return false;
@@ -250,6 +454,7 @@ bool CreateScheduledTask(std::wstring& error) {
         settings->put_StopIfGoingOnBatteries(VARIANT_FALSE);
         settings->put_StartWhenAvailable(VARIANT_TRUE);
         settings->put_MultipleInstances(TASK_INSTANCES_IGNORE_NEW);
+        settings->put_Priority(kTaskPriority);
         settings->put_Enabled(VARIANT_TRUE);
         Bstr unlimited(L"PT0S");
         settings->put_ExecutionTimeLimit(unlimited.value);
@@ -347,6 +552,30 @@ bool WriteRunValue(bool enabled, std::wstring& error) {
 bool IsStartupElevated() {
     bool matches = false;
     return QueryScheduledTask(matches) && matches;
+}
+
+bool IsStartupTaskOutdated() {
+    bool matches = false;
+    int priority = kTaskPriority;
+    // A priority the user picked within the normal range is left alone.
+    return QueryScheduledTask(matches, &priority) && matches && priority > kLowestNormalTaskPriority;
+}
+
+bool ExecutableLocationProtected() { return LocationProtected(ExecutablePath()); }
+
+bool RemoveUnsafeStartupTask(bool& removed, std::wstring& error) {
+    removed = false;
+    error.clear();
+    bool matches = false;
+    std::wstring target;
+    if (!QueryScheduledTask(matches, nullptr, &target) || matches) return true;
+    // Another copy's task is kept only when that copy sits in a protected
+    // location; one in a folder anyone can change, or a missing one, would
+    // let a planted program start elevated without a prompt.
+    if (!target.empty() && LocationProtected(target)) return true;
+    if (!DeleteScheduledTask(error)) return false;
+    removed = true;
+    return true;
 }
 
 bool IsStartupEnabled() {
@@ -1059,5 +1288,42 @@ std::wstring SettingsProfileBackupPath(bool beforeImport) {
     const DWORD attributes = GetFileAttributesW(profiles.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return {};
     return profiles + (beforeImport ? L"\\before-import.ini" : L"\\settings-backup.ini");
+}
+
+bool IsNetworkOrDevicePath(const std::wstring& input) {
+    if (input.empty()) return false;
+    // Long-path syntax on a drive letter is local; every other path that starts
+    // with two separators is UNC (\\host\share, \\host@SSL\..., \\?\UNC\...) or
+    // a device (\\.\..., \\?\GLOBALROOT\...), and \??\ is the object namespace.
+    const auto remoteSyntax = [](std::wstring& path) {
+        std::replace(path.begin(), path.end(), L'/', L'\\');
+        if (path.rfind(L"\\??\\", 0) == 0) return true;
+        if (path.size() >= 7 && path.rfind(L"\\\\?\\", 0) == 0 && path[5] == L':' && path[6] == L'\\') path.erase(0, 4);
+        return path.rfind(L"\\\\", 0) == 0;
+    };
+    std::wstring path = input;
+    if (remoteSyntax(path)) return true;
+    // A relative path resolves against the current folder, which may be a share.
+    std::vector<wchar_t> full(32768);
+    const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(full.size()), full.data(), nullptr);
+    if (!length || length >= full.size()) return true;
+    path.assign(full.data(), length);
+    if (remoteSyntax(path)) return true;
+    const wchar_t drive = path.empty() ? 0 : static_cast<wchar_t>(path[0] | 0x20);
+    if (path.size() < 3 || drive < L'a' || drive > L'z' || path[1] != L':' || path[2] != L'\\') return false;
+    const wchar_t root[]{path[0], L':', L'\\', 0};
+    return GetDriveTypeW(root) == DRIVE_REMOTE;
+}
+
+std::vector<ProfilePathField> NetworkProfilePaths(const Settings& settings) {
+    static constexpr ProfilePathField kFields[]{
+        {L"Released cursor", &Settings::releasedCursorPath}, {L"Pressed cursor", &Settings::pressedCursorPath},
+        {L"Left button sound", &Settings::leftSoundPath}, {L"Right button sound", &Settings::rightSoundPath},
+        {L"Middle button sound", &Settings::middleSoundPath}, {L"Keyboard sound set", &Settings::keyboardSoundPath},
+    };
+    std::vector<ProfilePathField> result;
+    for (const auto& field : kFields)
+        if (IsNetworkOrDevicePath(settings.*field.member)) result.push_back(field);
+    return result;
 }
 } // namespace clickshade

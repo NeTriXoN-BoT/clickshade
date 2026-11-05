@@ -4,6 +4,7 @@
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/cursorfont.h>
+#include <X11/keysym.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/shape.h>
@@ -219,7 +220,12 @@ int main(int argc, char** argv) {
     const auto stateAtom = XInternAtom(display, "_NET_WM_STATE", False);
     const auto fullAtom = XInternAtom(display, "_NET_WM_STATE_FULLSCREEN", False);
     XChangeProperty(display, window, stateAtom, XA_ATOM, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&fullAtom), 1); XFlush(display);
-    Check(Until([&] { return engine->Status().pausedByRule && engine->Status().stateText.find("fullscreen") != std::string::npos; }), "EWMH fullscreen state pauses all effects");
+    WaitMs(150);
+    Check(!engine->Status().pausedByRule && Overlay("ClickShade highlight") != None, "a fullscreen desktop application that is not a game keeps its effects");
+    // Steam gives its games a steam_app_ window class; a changed class is re-read.
+    XClassHint gameClass{const_cast<char*>("steam_app_480"), const_cast<char*>("ClickShadeTest")};
+    XSetClassHint(display, window, &gameClass); XFlush(display);
+    Check(Until([&] { return engine->Status().pausedByRule && engine->Status().stateText.find("fullscreen") != std::string::npos; }), "EWMH fullscreen state pauses all effects in a game");
     Button(1, true);
     Check(Until([&] { return engine->Status().heldButtons == 1 && !engine->Status().pressed; }), "fullscreen press leaves the native cursor untouched");
     Button(1, false); Until([&] { return engine->Status().heldButtons == 0; });
@@ -243,6 +249,7 @@ int main(int argc, char** argv) {
     // fullscreen. Explicit decorations/maximization distinguish desktop apps.
     const Window geometryWindow = Menu(0, 0, DisplayWidth(display, DefaultScreen(display)), DisplayHeight(display, DefaultScreen(display)));
     XDeleteProperty(display, geometryWindow, XInternAtom(display, "_NET_WM_WINDOW_TYPE", False));
+    XSetClassHint(display, geometryWindow, &gameClass);
     XDefineCursor(display, geometryWindow, original);
     XChangeProperty(display, root, active, XA_WINDOW, 32, PropModeReplace, reinterpret_cast<const unsigned char*>(&geometryWindow), 1); XFlush(display);
     Check(Until([&] { return engine->Status().pausedByRule; }), "borderless monitor-sized foreground window receives fullscreen protection");
@@ -269,6 +276,48 @@ int main(int argc, char** argv) {
     Check(Until([&] { return engine->Status().pausedByRule && engine->Status().stateText.find("transparent") != std::string::npos; }), "allowlist does not bypass transparent-cursor protection");
     XDefineCursor(display, window, original); XFlush(display);
     Check(Until([&] { return !engine->Status().pausedByRule; }), "restoring a visible application cursor resumes effects");
+
+    // Typing hold: editors hide the pointer as you type. Keys are observed
+    // here for keyboard sounds; no sound set is selected.
+    settings.magnifierEnabled = true; settings.keyboardSoundsEnabled = true; settings.keyboardSoundPath.clear();
+    engine->Update(settings);
+    Check(Until([] { return Overlay("ClickShade magnifier") != None; }), "the magnifier lens appears beside the pointer");
+    XDefineCursor(display, window, transparent); XFlush(display);
+    Check(Until([&] { return engine->Status().pausedByRule && Overlay("ClickShade magnifier") == None; }),
+        "a pointer hidden without typing hides the lens with every other effect");
+    XDefineCursor(display, window, original); XFlush(display);
+    Check(Until([&] { return !engine->Status().pausedByRule && Overlay("ClickShade magnifier") != None; }), "the lens returns with the visible pointer");
+    const KeyCode typedKey = XKeysymToKeycode(display, XK_a);
+    XTestFakeKeyEvent(display, typedKey, True, CurrentTime); XTestFakeKeyEvent(display, typedKey, False, CurrentTime); XFlush(display);
+    WaitMs(40);
+    XDefineCursor(display, window, transparent); XFlush(display);
+    Check(Until([&] { return engine->Status().pausedByRule && engine->Status().stateText.find("while you type") != std::string::npos; }),
+        "a pointer hidden right after a key press starts a typing hold");
+    const auto holdStart = engine->Status(); WaitMs(400); const auto holdLater = engine->Status();
+    Check(Overlay("ClickShade magnifier") != None && holdLater.wakeups >= holdStart.wakeups + 5,
+        "the held lens stays in place and keeps refreshing while you type");
+    Check(Until([] { return Overlay("ClickShade magnifier") == None; }, 3500), "the held lens leaves about three seconds after the last key");
+    XDefineCursor(display, window, original); XFlush(display);
+    settings.magnifierEnabled = false; settings.keyboardSoundsEnabled = false; engine->Update(settings);
+    Check(Until([&] { return !engine->Status().pausedByRule && Overlay("ClickShade magnifier") == None; }), "turning the lens off after a typing hold leaves no lens");
+
+    // A display-scale change while running resizes the effects. At 300% this
+    // lens reads a square larger than the monitor, which is kept on it.
+    const auto lensWidth = [] {
+        const Window lens = Overlay("ClickShade magnifier");
+        XWindowAttributes attributes{};
+        return lens && XGetWindowAttributes(display, lens, &attributes) ? attributes.width : 0;
+    };
+    const std::string resources = "Xft.dpi:\t288\n";
+    XChangeProperty(display, root, XA_RESOURCE_MANAGER, XA_STRING, 8, PropModeReplace,
+        reinterpret_cast<const unsigned char*>(resources.data()), static_cast<int>(resources.size()));
+    XFlush(display);
+    settings.magnifierEnabled = true; settings.magnifierSize = 600; settings.magnifierZoom = 125; engine->Update(settings);
+    Check(Until([&] { return lensWidth() == 1800; }), "a live Xft.dpi change rescales the lens, whose source stays on a smaller monitor");
+    XDeleteProperty(display, root, XA_RESOURCE_MANAGER); XFlush(display);
+    Check(Until([&] { return lensWidth() == 600; }), "removing the scale returns the lens to its normal size");
+    settings.magnifierEnabled = false; engine->Update(settings);
+    Until([] { return Overlay("ClickShade magnifier") == None; });
     XFreeCursor(display, transparent); XFreePixmap(display, transparentMask);
 
     GError* busError = nullptr;

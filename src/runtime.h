@@ -37,7 +37,7 @@ struct Settings {
     std::wstring releasedCursorPath;
     std::wstring pressedCursorPath; // Empty: derive pressed appearance by inversion.
     unsigned buttonMask = 3; // Left=1, right=2, middle=4, X1=8, X2=16.
-    bool pauseFullscreen = true;
+    bool pauseFullscreen = true; // Fullscreen games only; other fullscreen apps keep effects.
     bool pauseConfinedCursor = true;
     bool startWithWindows = false;
     bool startMinimized = false;
@@ -51,7 +51,7 @@ struct Settings {
     int highlightOpacity = 35;
     int highlightThickness = 3; // Logical pixels, outline mode.
     COLORREF highlightColor = RGB(255, 214, 64);
-    bool highlightBreathing = false; // Gentle opacity pulse while the pointer rests.
+    bool highlightBreathing = false; // Gentle opacity pulse of the highlight (not the spotlight).
     int highlightIdleHideMs = 0; // 0=always shown; otherwise hide after this idle time (500..10000).
     int spotlightDim = 55; // Percent darkness outside the spotlight circle (10..90).
     int spotlightRadius = 140; // Logical pixels (40..400).
@@ -129,7 +129,10 @@ struct RuntimeStatus {
     float locatorScale = 1.f; // Current logical locator size; no persisted history.
     bool ready = false;
     bool pressed = false;
-    bool fullscreen = false;
+    bool fullscreen = false; // The foreground window covers its whole monitor.
+    // That fullscreen app is a game, the only kind the fullscreen rule pauses.
+    // Evaluated only while that rule is on.
+    bool fullscreenGame = false;
     bool cursorConfined = false;
     bool sessionLocked = false;
     bool pausedByRule = false;
@@ -138,7 +141,6 @@ struct RuntimeStatus {
     std::size_t cursorCount = 0;
     std::uint64_t updateCount = 0;
     std::uint64_t previewRevision = 0;
-    double lastUpdateMicroseconds = 0;
     std::wstring foregroundProcess;
     std::wstring stateText = L"Starting cursor engine...";
     std::wstring lastError;

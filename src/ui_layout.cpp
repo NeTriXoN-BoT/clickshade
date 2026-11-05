@@ -102,7 +102,7 @@ public:
     void Combo(int id, int height = 30) { Put(id, Left(), cursor_, Inner(), 260); cursor_ += height + 6; }
     int Finish() {
         const int bottom = cursor_ + kCardPadding - 6;
-        app_.paintFrames.insert(app_.paintFrames.begin(), PaintFrame{{x_, y_, x_ + width_, bottom}, 14, true});
+        app_.paintFrames.insert(app_.paintFrames.begin(), PaintFrame{{x_, y_, x_ + width_, bottom}, 14});
         return bottom;
     }
 private:
@@ -160,8 +160,9 @@ void App::LoadIcons() {
         SendMessageW(window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(nextSmall));
         SetClassLongPtrW(window, GCLP_HICON, reinterpret_cast<LONG_PTR>(nextWindow));
         SetClassLongPtrW(window, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(nextSmall));
+        // NIF_SHOWTIP on every change keeps the standard tooltip of a version 4 icon.
         NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1;
-        data.uFlags = NIF_ICON; data.hIcon = nextSmall; Shell_NotifyIconW(NIM_MODIFY, &data);
+        data.uFlags = NIF_ICON | NIF_SHOWTIP; data.hIcon = nextSmall; Shell_NotifyIconW(NIM_MODIFY, &data);
     }
     if (icon) DestroyIcon(icon);
     if (windowIcon) DestroyIcon(windowIcon);
@@ -179,6 +180,7 @@ void App::FreePaintBuffers() {
     if (panelBitmap) DeleteObject(panelBitmap);
     if (panelBuffer) DeleteDC(panelBuffer);
     panelBuffer = nullptr; panelBitmap = panelOriginal = nullptr; panelSize = {};
+    FreeSpectrumStrip();
 }
 
 HDC App::Buffer(HDC dc, int width, int height, HDC& buffer, HBITMAP& bitmap, HBITMAP& original, SIZE& size) {
@@ -375,7 +377,7 @@ void App::CreateControls() {
         {Left, L"Left"}, {Right, L"Right"}, {Middle, L"Middle"}, {Side1, L"Side 1"}, {Side2, L"Side 2"}}}) toggle(item.first, item.second);
     button(CursorCurrent, L"Your Windows theme"); button(CursorWindows, L"Windows arrow");
     button(CursorClassic, L"Classic arrow"); button(CursorCustom, L"Custom pair");
-    toggle(PauseFullscreen, L"Pause all effects in fullscreen applications");
+    toggle(PauseFullscreen, L"Pause all effects in fullscreen games");
     toggle(PauseConfined, L"Pause when an application confines the pointer");
     HWND exclusions = Control(Excluded, L"EDIT", settings.excludedProcesses.c_str(), ES_AUTOHSCROLL);
     SendMessageW(exclusions, EM_SETLIMITTEXT, 2000, 0);
@@ -394,7 +396,7 @@ void App::CreateControls() {
     button(HighlightColor, L"Highlight color");
     button(HighlightFilledStyle, L"Filled"); button(HighlightRingStyle, L"Ring"); button(HighlightGlowStyle, L"Glow");
     button(HighlightCrosshairStyle, L"Crosshair"); button(HighlightSpotlightStyle, L"Spotlight");
-    toggle(HighlightBreathing, L"Gently pulse while the pointer rests");
+    toggle(HighlightBreathing, L"Gently pulse the highlight");
     toggle(IdleHideEnable, L"Hide the highlight when the mouse is idle");
     toggle(TrailEnable, L"Show cursor trail"); button(TrailColor, L"Trail color");
     button(TrailDots, L"Dots"); button(TrailRings, L"Rings"); button(TrailSparkles, L"Sparkles");
@@ -751,7 +753,9 @@ void App::Layout() {
     } else if (page == kPresenterPage + 1) {
         auto g = group({{FIELD(pauseFullscreen)}, {FIELD(pauseConfinedCursor)}, {FIELD(excludedProcesses)}, {FIELD(allowedProcesses)}});
         card(0, L"Smart pause", [&](CardBuilder& c) {
-            c.Toggle(PauseFullscreen); c.Toggle(PauseConfined);
+            c.Toggle(PauseFullscreen);
+            c.Hint(L"Browsers, videos and presentations keep their effects in fullscreen. Games are recognized from Windows' own game list and the usual libraries (Steam, Epic, GOG, EA, Ubisoft, Xbox and others); if one is missed, add it under Excluded applications.");
+            c.Toggle(PauseConfined);
             c.Text(L"Excluded applications", FontSmall, 20);
             c.Field(Excluded, {{ExcludeBrowse, 90}, {ApplyExcluded, 62}});
             c.Hint(L"Separate executable names with semicolons, or choose an application with Add app. For windowed games, add their .exe here.");
@@ -762,7 +766,8 @@ void App::Layout() {
         card(1, L"Administrator windows", [&](CardBuilder& c) {
             c.Toggle(RunAsAdmin);
             c.Hint(elevated ? L"ClickShade is running as administrator, so effects, shortcuts and held-button tracking also work over Task Manager, installers and other elevated windows."
-                            : L"Windows keeps normal apps from fully reacting to windows that run as administrator (Task Manager, installers, some games). Turn this on to run ClickShade elevated: one prompt per manual start, none when it starts with Windows.",
+                   : elevatedStartupAllowed ? L"Windows keeps normal apps from fully reacting to windows that run as administrator (Task Manager, installers, some games). Turn this on to run ClickShade elevated: one prompt per manual start, none when it starts with Windows."
+                   : L"Windows keeps normal apps from fully reacting to windows that run as administrator (Task Manager, installers, some games). Turn this on to run ClickShade elevated: one prompt per manual start and at sign-in, because this folder is not protected like Program Files.",
                    elevated ? colors.success : CLR_INVALID);
             if (!compatibilityNote.empty()) c.Hint(compatibilityNote, colors.warning);
         });
@@ -774,8 +779,9 @@ void App::Layout() {
         g = group({{FIELD(startMinimized)}});
         card(1, L"Startup and background", [&](CardBuilder& c) {
             c.Toggle(Startup); c.Toggle(Minimized);
-            c.Hint(settings.runAsAdministrator ? L"With administrator mode on, startup uses a scheduled task so no prompt appears at sign-in. Closing the settings window keeps ClickShade in the tray; Quit stops it and restores your cursors."
-                                               : L"Closing the settings window keeps ClickShade in the tray. Quit stops it and restores your cursors.");
+            c.Hint(!settings.runAsAdministrator ? L"Closing the settings window keeps ClickShade in the tray. Quit stops it and restores your cursors."
+                   : elevatedStartupAllowed ? L"With administrator mode on, startup uses a scheduled task so no prompt appears at sign-in. Closing the settings window keeps ClickShade in the tray; Quit stops it and restores your cursors."
+                   : L"With administrator mode on, Windows asks for approval at sign-in until ClickShade is in a protected folder such as Program Files. Closing the settings window keeps ClickShade in the tray; Quit stops it and restores your cursors.");
         }, g.first, g.second);
     } else if (page == kAppearancePage) {
         auto g = group({{FIELD(uiDarkMode)}, {FIELD(uiBackground)}, {FIELD(uiAccent)}, {FIELD(uiDarkBackground)}, {FIELD(uiDarkAccent)}, {FIELD(uiLightBackground)}, {FIELD(uiLightAccent)}});

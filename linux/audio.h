@@ -10,6 +10,8 @@ namespace clickshade::linuxapp {
 // a dedicated worker. Clip duration does not determine memory use. Optional libpulse
 // output is loaded at runtime and works with PulseAudio or PipeWire's Pulse
 // server. Click/Key/Preview never read files, decode audio, or wait for playback.
+// The stream is corked while nothing plays, so the sound server can suspend
+// the device, and closed while both sound groups are switched off.
 //
 // Mouse buttons and the keyboard are separate groups with their own volume. A
 // keyboard set is a folder with key*.wav variants plus optional space.wav,
@@ -24,10 +26,13 @@ public:
     bool Start(const Settings&, std::string& error);
     void Stop() noexcept;
     void Update(const Settings&);
-    void SetAllowed(bool) noexcept;
+    // Mouse and keyboard sounds have separate allowances: an application that
+    // hides the pointer pauses click sounds while typing sounds continue.
+    void SetAllowed(bool mouse, bool keyboard) noexcept;
+    void SetAllowed(bool value) noexcept { SetAllowed(value, value); }
     void Click(unsigned buttonMask) noexcept;
     void Key(unsigned category) noexcept;
-    // Previews ignore the sound toggles, but still obey SetAllowed.
+    // Previews ignore the sound toggles, but still obey their group's allowance.
     void Preview(unsigned buttonMask) noexcept;
     void PreviewKey() noexcept;
     std::string LastError() const;

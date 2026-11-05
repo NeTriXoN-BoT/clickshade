@@ -9,7 +9,8 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {DEFAULTS, HIGHLIGHT_STYLES, CLICK_STYLES, KEY_MODIFIERS, parseIni, colorChannels, curve, breath,
     excluded, effectiveRate, nextDeadline, buttonEdges, keyCategory, keyDisplayWanted, keyChordParts,
-    modifiersFromState, isModifierKeysym, modifierBit, lensOrigin, typedText, addKeyStroke} from './core.js';
+    modifiersFromState, isModifierKeysym, modifierBit, lensOrigin, typedText, addKeyStroke,
+    BREATH_INTERVAL_US, TYPING_HOLD_US, typingHold, parseCommandLine, isGameWindow} from './core.js';
 
 const KEY_FADE_MS = 350;
 const BACKSPACE = 0xff08;
@@ -29,6 +30,7 @@ const DBUS_XML = `<node><interface name="org.gnome.Shell.Extensions.ClickShade1"
   <signal name="Click"><arg name="buttonMask" type="u"/></signal>
   <signal name="Key"><arg name="category" type="u"/></signal>
   <signal name="AllowedChanged"><arg name="allowed" type="b"/></signal>
+  <signal name="MouseAllowedChanged"><arg name="allowed" type="b"/></signal>
 </interface></node>`;
 
 // How far a highlight style reaches beyond its nominal radius.
@@ -158,15 +160,21 @@ class Circle {
 export default class ClickShadeExtension extends Extension {
     enable() {
         this._alive = true;
-        this._active = true;
+        // Effects wait for the ClickShade app: its SetActive(true) starts
+        // them, and they pause again when it leaves the bus.
+        this._active = false;
+        this._ownerWatch = 0;
+        this._ownerToken = null;
         this._config = {...DEFAULTS};
         this._lastError = '';
-        this._lastAllowed = null;
+        this._rules = {};
         this._signals = [];
         this._timer = 0;
         this._reloadTimer = 0;
         this._idleHideTimer = 0;
+        this._typingTimer = 0;
         this._deadline = 0;
+        this._breathAt = 0;
         this._loadSerial = (this._loadSerial ?? 0) + 1;
         this._cancel = new Gio.Cancellable();
         this._particles = [];
@@ -182,6 +190,10 @@ export default class ClickShadeExtension extends Extension {
         this._isExcluded = false;
         this._focus = null;
         this._focusSignal = 0;
+        this._windows = new WeakMap();
+        this._lastKey = 0;
+        this._pointerWasHidden = false;
+        this._typing = false;
         this._lastX = null;
         this._lastY = null;
         this._lastMove = GLib.get_monotonic_time();
@@ -221,10 +233,13 @@ export default class ClickShadeExtension extends Extension {
             this._focusChanged();
             this._monitorConfig();
             this.Reload();
+            // The lock screen disables and re-enables the extension. If the
+            // app that activated the effects still runs, they resume.
+            if (this._owner) this._watchOwner(this._owner);
         } catch (error) {
             this._lastError = `Could not enable ClickShade: ${error.message}`;
             this._active = false;
-            this._publishAllowed(false);
+            this._publishAllowed();
             this._hideAll();
         }
     }
@@ -296,7 +311,8 @@ export default class ClickShadeExtension extends Extension {
             this._idleWatch = this._idleMonitor.add_idle_watch(1200, () => {
                 if (!this._alive) return;
                 this._idle = true;
-                if (!this._particles.length && !this._breathing()) this._cancelTimer();
+                // Only pulses still running and a breathing highlight keep frames.
+                if (!this._particles.length) { this._cancelTimer(); this._schedule(); }
                 this._scheduleIdleHide();
                 if (!this._activeWatch)
                     this._activeWatch = this._idleMonitor.add_user_active_watch(() => {
@@ -314,6 +330,12 @@ export default class ClickShadeExtension extends Extension {
     _breathing() {
         return this._config.HighlightEnabled && this._config.HighlightBreathing &&
             this._config.HighlightStyle !== HIGHLIGHT_STYLES.SPOTLIGHT;
+    }
+
+    // An idle-hidden highlight has nothing left to breathe.
+    _breathVisible(now) {
+        const limit = this._config.HighlightIdleHideMs;
+        return this._breathing() && !(limit > 0 && now - this._lastMove >= limit * 1000);
     }
 
     // Sampling stops when the session is idle, so the hide deadline gets its
@@ -343,10 +365,8 @@ export default class ClickShadeExtension extends Extension {
         if (window) {
             this._identities = [window.get_wm_class?.(), window.get_gtk_application_id?.(),
                 window.get_sandboxed_app_id?.(), Shell.WindowTracker.get_default().get_window_app(window)?.get_id()];
-            try {
-                const pid = window.get_pid();
-                if (pid > 0) this._identities.push(GLib.path_get_basename(GLib.file_read_link(`/proc/${pid}/exe`)));
-            } catch (_) { /* Sandboxed/remote windows may not expose a local executable. */ }
+            const {exe} = this._process(window);
+            if (exe) this._identities.push(GLib.path_get_basename(exe));
             try { this._focusSignal = window.connect('notify::fullscreen', () => this._wake(true)); }
             catch (_) { /* The display-level fullscreen signal remains connected. */ }
         }
@@ -355,22 +375,74 @@ export default class ClickShadeExtension extends Extension {
         this._wake(true);
     }
 
-    // forKeys: the key display ignores a hidden pointer, because editors hide
-    // it while you type, which is exactly when the keys should show.
+    // A window's process, read once per window. Sandboxed or remote windows
+    // may not expose a local executable.
+    _process(window) {
+        let info = this._windows.get(window);
+        if (info) return info;
+        info = {pid: 0, exe: '', argv: null, wmClass: null, game: false};
+        this._windows.set(window, info);
+        try { info.pid = window.get_pid?.() ?? 0; } catch (_) { /* No local process. */ }
+        if (info.pid > 0) {
+            try { info.exe = GLib.file_read_link(`/proc/${info.pid}/exe`).replace(/ \(deleted\)$/, ''); }
+            catch (_) { /* The command line may still identify it. */ }
+        }
+        return info;
+    }
+
+    // Only a fullscreen window's command line is read, once, for game
+    // detection. A window can set its class after it maps, so the cached
+    // answer is rechecked against the current class.
+    _isGame(window) {
+        try {
+            const info = this._process(window);
+            const wmClass = window.get_wm_class?.() ?? '';
+            if (info.wmClass !== wmClass) {
+                info.argv ??= this._commandLine(info.pid);
+                info.wmClass = wmClass;
+                info.game = isGameWindow({wmClass, exe: info.exe, argv: info.argv, home: GLib.get_home_dir()});
+            }
+            return info.game;
+        } catch (_) { return false; }
+    }
+
+    _commandLine(pid) {
+        if (pid <= 0) return [];
+        try {
+            const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/cmdline`);
+            return ok ? parseCommandLine(new TextDecoder().decode(bytes)) : [];
+        } catch (_) { return []; }
+    }
+
+    // forKeys: the key display and keyboard sounds ignore a hidden pointer,
+    // because editors hide it while you type, which is exactly when they matter.
     _pauseReason(forKeys = false) {
         if (!this._supported) return 'Required GNOME pointer/actor APIs are unavailable';
         if (!this._active || !this._config.Enabled) return 'Paused';
         if (Main.sessionMode.isLocked || Main.sessionMode.isGreeter) return 'Paused on the lock/login screen';
         if (this._isExcluded) return 'Paused for an excluded application';
-        if (!this._isAllowed && this._config.PauseFullscreen && this._focus?.is_fullscreen?.()) return 'Paused for a fullscreen application';
-        if (!forKeys && this._tracker?.get_pointer_visible && !this._tracker.get_pointer_visible()) return 'Paused while the pointer is hidden';
+        if (!this._isAllowed && this._config.PauseFullscreen && this._focus?.is_fullscreen?.() && this._isGame(this._focus))
+            return 'Paused for a fullscreen game';
+        if (!forKeys && this._pointerHidden()) return 'Paused while the pointer is hidden';
         return '';
     }
 
-    _hasFeatures() {
-        return this._config.HighlightEnabled || this._config.ClickEffectsEnabled ||
-            this._config.ClickSoundsEnabled || this._config.KeyboardSoundsEnabled ||
-            this._config.MagnifierEnabled || this._config.KeyDisplayEnabled;
+    // Whether the Shell hides the pointer. It also follows the typing hold:
+    // a pointer that hides soon after a key press was hidden by typing.
+    _pointerHidden() {
+        const hidden = Boolean(this._tracker?.get_pointer_visible && !this._tracker.get_pointer_visible());
+        this._typing = typingHold(this._typing, this._pointerWasHidden, hidden, this._lastKey, GLib.get_monotonic_time());
+        this._pointerWasHidden = hidden;
+        if (!this._typing && this._typingTimer) { GLib.Source.remove(this._typingTimer); this._typingTimer = 0; }
+        return hidden;
+    }
+
+    // Only these use the sampled pointer. Keyboard sounds and key labels come
+    // from captured events, so they alone never run the sampling timer.
+    _pointerFeatures() {
+        const config = this._config;
+        return config.HighlightEnabled || config.ClickEffectsEnabled || config.ClickSoundsEnabled ||
+            config.MagnifierEnabled || (config.KeyDisplayEnabled && config.KeyDisplayMouse);
     }
 
     _buttons(modifiers) {
@@ -401,15 +473,38 @@ export default class ClickShadeExtension extends Extension {
             } else if (type === Clutter.EventType.KEY_PRESS || (Clutter.EventType.KEY_RELEASE !== undefined && type === Clutter.EventType.KEY_RELEASE)) {
                 const pressed = type === Clutter.EventType.KEY_PRESS;
                 const repeated = Boolean((event.get_flags?.() ?? 0) & (Clutter.EventFlags?.REPEATED ?? 0));
+                if (pressed) this._keyPressed();
                 // Keyboard sounds: only a coarse category leaves the Shell (key,
-                // space, enter or backspace). Repeats are skipped and nothing is stored.
-                if (pressed && this._config.KeyboardSoundsEnabled && !repeated && !this._pauseReason())
+                // space, enter or backspace). Repeats are skipped and nothing is
+                // stored. A hidden pointer does not silence them.
+                if (pressed && this._config.KeyboardSoundsEnabled && !repeated && !this._pauseReason(true))
                     this._dbus?.emit_signal('Key', new GLib.Variant('(u)', [keyCategory(event.get_key_symbol())]));
                 if (this._config.KeyDisplayEnabled) this._keyEvent(event, pressed, repeated);
             }
         } catch (error) { this._fail(error); }
         // Observation only: no pointer/keyboard grab and never stop propagation.
         return Clutter.EVENT_PROPAGATE;
+    }
+
+    // Only the time of the last key press is kept, for the typing hold; a key
+    // pressed during the hold extends it.
+    _keyPressed() {
+        this._lastKey = GLib.get_monotonic_time();
+        if (this._typing && this._typingTimer) this._scheduleTypingEnd(true);
+    }
+
+    // Ends the typing hold about 3 s after the last key, even when no other
+    // event arrives while the pointer stays hidden.
+    _scheduleTypingEnd(holding) {
+        if (this._typingTimer) GLib.Source.remove(this._typingTimer);
+        this._typingTimer = 0;
+        if (!holding || !this._alive) return;
+        const remaining = Math.max(1, Math.ceil((this._lastKey + TYPING_HOLD_US - GLib.get_monotonic_time()) / 1000));
+        this._typingTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, remaining, () => {
+            this._typingTimer = 0;
+            this._wake();
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _keyEvent(event, pressed, repeated) {
@@ -622,7 +717,8 @@ export default class ClickShadeExtension extends Extension {
         if (this._config.HighlightEnabled && !resting) {
             if (!this._highlight) this._highlight = new Circle();
             const breathing = this._breathing();
-            if (!this._haloSignature || breathing) {
+            // Breathing repaints at its own slow pace, not at every sample.
+            if (!this._haloSignature || (breathing && now >= this._breathAt)) {
                 const scale = this._density();
                 const style = this._config.HighlightStyle;
                 const swell = breathing ? breath(now) : {radius: 1, opacity: 1};
@@ -632,6 +728,7 @@ export default class ClickShadeExtension extends Extension {
                     opacity: Math.min(100, this._config.HighlightOpacity * swell.opacity)};
                 this._highlight.setShape(shape, highlightExtent(style, nominal));
                 this._haloSignature = 'ready';
+                if (breathing) this._breathAt = nextDeadline(this._breathAt, now, BREATH_INTERVAL_US);
             }
             this._highlight.move(x, y);
         } else this._highlight?.hide();
@@ -679,8 +776,8 @@ export default class ClickShadeExtension extends Extension {
         if (!this._alive) return;
         try {
             const paused = Boolean(this._pauseReason());
-            this._publishAllowed(!paused);
-            if (paused || !this._hasFeatures()) { this._hideAll(); return; }
+            this._publishAllowed();
+            if (paused || !this._pointerFeatures()) { this._hideAll(); return; }
             const now = GLib.get_monotonic_time();
             this._sample(now);
             this._particles = this._particles.filter(particle => {
@@ -694,10 +791,15 @@ export default class ClickShadeExtension extends Extension {
     }
 
     _schedule() {
-        if (this._timer || !this._alive || (!this._particles.length && this._idle && !this._breathing()) || this._pauseReason()) return;
+        if (this._timer || !this._alive || this._pauseReason()) return;
         const now = GLib.get_monotonic_time();
+        // While the session is idle only a visible breathing highlight needs
+        // frames, and only at its own slow pace.
+        const sampling = this._particles.length > 0 || !this._idle;
+        if (!sampling && !this._breathVisible(now)) return;
         if (!this._deadline || this._deadline < now) this._deadline = now + 1000000 / this._rate;
-        const milliseconds = Math.max(1, Math.ceil((this._deadline - now) / 1000));
+        const due = sampling ? this._deadline : Math.max(this._deadline, this._breathAt);
+        const milliseconds = Math.max(1, Math.ceil((due - now) / 1000));
         this._timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, milliseconds, () => {
             this._timer = 0;
             this._tick();
@@ -708,18 +810,29 @@ export default class ClickShadeExtension extends Extension {
     _wake(resetButtons = false) {
         if (!this._alive) return;
         const paused = Boolean(this._pauseReason());
-        this._publishAllowed(!paused);
+        this._publishAllowed();
         if (this._supported && resetButtons) this._down = this._buttons(global.get_pointer()[2]);
         if (paused) { this._hideAll(); return; }
         this._tick();
     }
 
-    _publishAllowed(allowed, force = false) {
-        if (!this._alive || !this._dbus || (!force && this._lastAllowed === allowed)) return;
-        this._lastAllowed = allowed;
+    // AllowedChanged carries every rule except the hidden pointer, so keyboard
+    // sounds keep playing while an editor hides the pointer. MouseAllowedChanged
+    // adds the hidden pointer, so the app can stop click voices alone.
+    _publishAllowed(force = false) {
+        if (!this._alive || !this._dbus) return;
+        const keys = !this._pauseReason(true);
+        const hidden = this._pointerHidden();
+        this._emitRule('AllowedChanged', keys, force);
+        this._emitRule('MouseAllowedChanged', keys && !hidden, force);
+    }
+
+    _emitRule(name, allowed, force) {
+        if (!force && this._rules[name] === allowed) return;
+        this._rules[name] = allowed;
         // The native audio worker must flush existing voices when a rule
-        // pauses effects, as well as stop receiving new click notifications.
-        try { this._dbus.emit_signal('AllowedChanged', new GLib.Variant('(b)', [allowed])); }
+        // pauses effects, as well as stop receiving new notifications.
+        try { this._dbus.emit_signal(name, new GLib.Variant('(b)', [allowed])); }
         catch (error) { this._lastError = `ClickShade audio rule notification failed: ${error.message}`; }
     }
 
@@ -738,50 +851,113 @@ export default class ClickShadeExtension extends Extension {
         this._cancelTimer();
         this._cancelIdleHide();
         this._highlight?.hide();
-        // Typing hides the pointer in many editors: the lens and the key
-        // display stay where they are; any other pause hides them.
-        if (this._pauseReason(true)) { this._hideLens(); this._hideKeys(); }
         this._clearParticles();
+        const rule = this._pauseReason(true);
+        // Editors hide the pointer while you type: during the typing hold the
+        // lens stays where it is. Any other hidden pointer or pause hides it;
+        // the key display ignores the pointer and obeys only the other rules.
+        const holding = !rule && this._pointerHidden() && this._typing;
+        if (!holding) this._hideLens();
+        if (rule) this._hideKeys();
+        this._scheduleTypingEnd(holding);
     }
 
     _fail(error) {
         this._lastError = `Pointer effects paused: ${error.message}`;
         this._active = false;
-        this._publishAllowed(false);
+        this._publishAllowed();
         this._hideAll();
     }
 
-    SetActive(active) {
-        this._active = Boolean(active);
+    // D-Bus SetActive. GJS hands the invocation, and with it the caller's bus
+    // name, only to an ...Async handler, and it prefers a plain SetActive
+    // method, so this class has none.
+    SetActiveAsync([active], invocation) {
+        try { this._setActive(Boolean(active), invocation.get_sender?.() ?? null); }
+        catch (error) { this._fail(error); }
+        invocation.return_value(null);
+    }
+
+    _setActive(active, sender = null) {
+        this._active = active;
+        this._watchOwner(active ? sender : null);
         this._wake(true);
         // A newly connected GTK process needs the current rule state even
         // when the extension was already enabled before it subscribed.
-        this._publishAllowed(!this._pauseReason(), true);
+        this._publishAllowed(true);
     }
 
-    Restore() { this.SetActive(false); }
+    // The effects belong to the app that activated them: its unique bus name
+    // is watched, so they pause when it quits, crashes or is killed. Without
+    // a name or a watch they stop only on SetActive(false).
+    _watchOwner(name) {
+        if (name && name === this._owner && this._ownerWatch) return;
+        this._unwatchOwner();
+        this._owner = name || null;
+        if (!this._owner) return;
+        const token = {};
+        this._ownerToken = token;
+        try {
+            this._ownerWatch = Gio.bus_watch_name_on_connection(Gio.DBus.session, this._owner,
+                Gio.BusNameWatcherFlags.NONE,
+                () => { if (this._ownerToken === token) this._ownerAppeared(); },
+                () => { if (this._ownerToken === token) this._ownerVanished(); });
+        } catch (_) { this._ownerWatch = 0; this._ownerToken = null; }
+    }
+
+    // Removes the watch but remembers the owner for the next enable().
+    _unwatchOwner() {
+        if (this._ownerWatch) Gio.bus_unwatch_name(this._ownerWatch);
+        this._ownerWatch = 0;
+        this._ownerToken = null;
+    }
+
+    _ownerAppeared() {
+        if (!this._alive || this._active) return;
+        this._active = true;
+        this._wake(true);
+        this._publishAllowed(true);
+    }
+
+    _ownerVanished() {
+        this._watchOwner(null);
+        if (!this._alive) return;
+        this._active = false;
+        this._wake(true);
+    }
+
+    Restore() { this._setActive(false); }
 
     GetStatus() {
         const pause = this._pauseReason();
-        const state = pause || `GNOME effects active · ${Math.round(this._rate)} Hz sampling limit`;
+        // Limits of this Shell build go into the status line, which the app shows.
+        const limits = [];
+        if (!this._tracker?.get_pointer_visible) limits.push('this Shell does not report a hidden pointer');
+        if (!this._idleMonitor) limits.push('no idle watch, so sampling continues while an effect is on');
+        const state = pause || [`GNOME effects active · ${Math.round(this._rate)} Hz sampling limit`, ...limits].join(' · ');
         let capabilities = 'GNOME Shell highlight (filled, ring, glow, crosshair; the spotlight is drawn as a glow) with breathing and idle hide; ' +
             'left/right/middle click effects in ring, pulse, ripple, burst, neon and target styles; a square magnifier lens beside the pointer cloned from the window layer; ' +
-            'an on-screen key display whose labels exist only while shown; fullscreen and application exclusions; ' +
+            'an on-screen key display whose labels exist only while shown; a fullscreen pause for games only (Steam, Wine/Proton, gamescope, Heroic, Lutris, itch); ' +
+            'a hidden pointer hides every pointer effect, except the lens during a short typing hold; application exclusions; ' +
             'click and keyboard sounds play in the running GTK app from coarse notifications (button mask; key, space, enter or backspace). ' +
+            'Effects run only while the ClickShade app that activated them is connected. ' +
             'Cursor replacement, custom cursor files, reverse/hold cursor modes, shake enlargement, trails, global shortcuts and ' +
             'confined-pointer detection are unavailable. Global clicks use sampled button state plus available Shell events; ' +
             'presses shorter than one sample can be missed. Compositor integration is experimental and not runtime-validated here.';
         if (!this._tracker?.get_pointer_visible) capabilities += ' Pointer visibility reporting is unavailable on this Shell build.';
-        if (!this._idleMonitor) capabilities += ' Idle-watch API unavailable; sampling continues while enabled.';
+        if (!this._idleMonitor) capabilities += ' Idle-watch API unavailable; sampling continues while a pointer effect is on.';
         return [this._active && this._config.Enabled, this._supported, state, this._lastError, capabilities];
     }
 
     disable() {
-        this._publishAllowed(false);
-        this._alive = false;
         this._active = false;
+        this._publishAllowed();
+        this._alive = false;
         this._cancel?.cancel();
         this._hideAll();
+        this._unwatchOwner();
+        if (this._typingTimer) GLib.Source.remove(this._typingTimer);
+        this._typingTimer = 0;
         if (this._reloadTimer) GLib.Source.remove(this._reloadTimer);
         this._reloadTimer = 0;
         if (this._focus && this._focusSignal) this._focus.disconnect(this._focusSignal);

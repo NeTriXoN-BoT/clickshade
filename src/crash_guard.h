@@ -17,11 +17,13 @@ namespace clickshade {
 //   1. restore the user's own cursor scheme (SPI_SETCURSORS),
 //   2. write one plain-text report (and a small minidump when dbghelp is
 //      available) to the crash-reports folder beside the settings file,
-//   3. start a fresh instance that shows what happened, unless this process
-//      was itself restarted after a crash a moment ago.
-// Reports contain the version, the fault code/address, module offsets and a
-// return-address stack. They never contain settings, paths you selected,
-// screen contents or input. At most five reports are kept.
+//   3. start a fresh instance with a notice, up to three crashes in a row;
+//      the next one shows a message instead. A restarted instance that runs
+//      for 90 seconds resets the count.
+// The text report contains the version, the fault code/address, module
+// offsets and a return-address stack, never settings or screen contents. The
+// minidump holds thread stack memory, which can include recent input or file
+// paths. At most five reports are kept.
 struct CrashGuardOptions {
     bool restartAfterCrash = true;
     unsigned restartGeneration = 0; // From --after-crash <n>; limits restart loops.

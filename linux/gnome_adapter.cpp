@@ -11,19 +11,12 @@ namespace {
 constexpr const char* kBus = "org.gnome.Shell";
 constexpr const char* kPath = "/org/gnome/Shell/Extensions/ClickShade";
 constexpr const char* kInterface = "org.gnome.Shell.Extensions.ClickShade1";
-constexpr const char* kCapabilities =
-    "GNOME Wayland requires the bundled ClickShade Shell extension. Native Shell highlight and left/right/middle click effects "
-    "in every style (the spotlight falls back to a glow); sampled button state can miss presses shorter than one sampling interval. "
-    "Click and keyboard sounds play through this app from the extension's coarse notifications. Cursor replacement, custom cursor "
-    "files, reverse/hold cursor modes, shake enlargement, trails, global shortcuts and confined-pointer detection are unavailable. "
-    "This experimental compositor integration has not been runtime-validated on GNOME.";
 
 class GnomeEngine final : public LinuxEngine {
 public:
     GnomeEngine() {
         status_.backend = "GNOME Wayland · Shell extension";
         status_.stateText = "Waiting for the GNOME Shell extension";
-        status_.capabilities = kCapabilities;
     }
     ~GnomeEngine() override { Stop(); }
 
@@ -34,9 +27,11 @@ public:
         stopping_.store(false);
         reload_.store(true);
         restore_.store(false);
-        desiredActive_.store(true);
+        desiredActive_.store(settings.enabled);
         masterEnabled_.store(settings.enabled);
         extensionAllowed_.store(false);
+        extensionMouseAllowed_.store(false);
+        mouseSignal_.store(false);
         cancelled_ = g_cancellable_new();
         std::string audioError;
         audio_.Start(settings, audioError);
@@ -60,9 +55,11 @@ public:
         audio_.Update(settings);
         masterEnabled_.store(settings.enabled);
         reload_.store(true);
-        restore_.store(false);
-        desiredActive_.store(true);
-        audio_.SetAllowed(settings.enabled && extensionAllowed_.load());
+        // SetActive carries the master switch, and a pending Restore, to the
+        // Shell at once instead of waiting for the saved settings file.
+        if (settings.enabled) restore_.store(false);
+        desiredActive_.store(settings.enabled);
+        ApplyAudioAllowance();
         Wake();
     }
 
@@ -70,6 +67,7 @@ public:
         stopping_.store(true);
         desiredActive_.store(false);
         extensionAllowed_.store(false);
+        extensionMouseAllowed_.store(false);
         audio_.SetAllowed(false);
         if (cancelled_) g_cancellable_cancel(cancelled_);
         Wake();
@@ -103,6 +101,7 @@ public:
         reload_.store(false);
         desiredActive_.store(false);
         extensionAllowed_.store(false);
+        extensionMouseAllowed_.store(false);
         audio_.SetAllowed(false);
         Wake();
     }
@@ -114,13 +113,23 @@ private:
     std::thread worker_;
     std::atomic<bool> stopping_{true}, reload_{false}, restore_{false}, desiredActive_{true};
     std::atomic<bool> wakePending_{false};
-    std::atomic<bool> masterEnabled_{false}, extensionAllowed_{false};
+    // AllowedChanged covers every rule except the hidden pointer (keyboard
+    // sounds); MouseAllowedChanged adds the hidden pointer for click sounds.
+    // mouseSignal_: the extension sends the second signal at all.
+    std::atomic<bool> masterEnabled_{false}, extensionAllowed_{false}, extensionMouseAllowed_{false}, mouseSignal_{false};
     GMainContext* context_ = nullptr; // Protected by mutex_; owned by worker.
     GMainLoop* loop_ = nullptr;
     GCancellable* cancelled_ = nullptr; // Start/Stop only; worker borrows.
     GDBusConnection* connection_ = nullptr;
-    guint subscription_ = 0, keySubscription_ = 0, allowedSubscription_ = 0;
+    guint subscription_ = 0, keySubscription_ = 0, allowedSubscription_ = 0, mouseAllowedSubscription_ = 0;
     bool activated_ = false;
+
+    void ApplyAudioAllowance() {
+        const bool live = masterEnabled_.load() && desiredActive_.load() && !stopping_.load();
+        const bool keys = live && extensionAllowed_.load();
+        // An extension without the mouse signal pauses both groups together.
+        audio_.SetAllowed(keys && (!mouseSignal_.load() || extensionMouseAllowed_.load()), keys);
+    }
 
     void Wake() {
         // A slider can change many times while a synchronous D-Bus call is in
@@ -157,12 +166,13 @@ private:
     void SetFailure(const char* detail) {
         activated_ = false;
         extensionAllowed_.store(false);
+        extensionMouseAllowed_.store(false);
+        mouseSignal_.store(false);
         audio_.SetAllowed(false);
         std::lock_guard<std::mutex> guard(mutex_);
         status_.running = false;
         status_.globalSupported = false;
         status_.stateText = "GNOME extension is unavailable";
-        status_.capabilities = kCapabilities;
         status_.lastError = "Install and enable clickshade@local in GNOME Shell, then choose Retry. "
             "Other Wayland compositors are not supported by this backend.";
         if (detail && *detail) status_.lastError += std::string(" Details: ") + detail;
@@ -209,8 +219,21 @@ private:
                 g_variant_get(parameters, "(b)", &allowed);
                 auto* self = static_cast<GnomeEngine*>(data);
                 self->extensionAllowed_.store(allowed);
-                self->audio_.SetAllowed(allowed && self->masterEnabled_.load() &&
-                    self->desiredActive_.load() && !self->stopping_.load());
+                self->ApplyAudioAllowance();
+            }, this, nullptr);
+        // Click sounds also stop while the pointer is hidden; typing sounds
+        // continue. Extensions up to 1.0 do not send this signal.
+        mouseAllowedSubscription_ = g_dbus_connection_signal_subscribe(connection_, kBus, kInterface,
+            "MouseAllowedChanged", kPath, nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
+            [](GDBusConnection*, const gchar*, const gchar*, const gchar*, const gchar*,
+               GVariant* parameters, gpointer data) {
+                if (!g_variant_is_of_type(parameters, G_VARIANT_TYPE("(b)"))) return;
+                gboolean allowed = FALSE;
+                g_variant_get(parameters, "(b)", &allowed);
+                auto* self = static_cast<GnomeEngine*>(data);
+                self->extensionMouseAllowed_.store(allowed);
+                self->mouseSignal_.store(true);
+                self->ApplyAudioAllowance();
             }, this, nullptr);
     }
 
@@ -245,22 +268,34 @@ private:
             activated_ = true;
         }
         GError* error = nullptr;
-        GVariant* answer = Call("GetStatus", nullptr, G_VARIANT_TYPE("(bbsss)"), &error);
+        GVariant* answer = Call("GetStatus", nullptr, nullptr, &error);
         if (!answer) {
             SetFailure(error ? error->message : "The extension did not provide status.");
             g_clear_error(&error);
             return;
         }
+        // (running, supported, state, message). Extensions up to 1.0 append a
+        // capability text, which is not shown and therefore ignored.
+        if (!g_variant_is_of_type(answer, G_VARIANT_TYPE("(bbss)")) && !g_variant_is_of_type(answer, G_VARIANT_TYPE("(bbsss)"))) {
+            g_variant_unref(answer);
+            SetFailure("The extension returned an unexpected status.");
+            return;
+        }
         gboolean running = FALSE, supported = FALSE;
-        const gchar *state = nullptr, *message = nullptr, *capabilities = nullptr;
-        g_variant_get(answer, "(bb&s&s&s)", &running, &supported, &state, &message, &capabilities);
+        g_variant_get_child(answer, 0, "b", &running);
+        g_variant_get_child(answer, 1, "b", &supported);
+        const auto text = [answer](gsize index) {
+            GVariant* child = g_variant_get_child_value(answer, index);
+            std::string value = g_variant_get_string(child, nullptr);
+            g_variant_unref(child);
+            return value;
+        };
         {
             std::lock_guard<std::mutex> guard(mutex_);
             status_.running = running;
             status_.globalSupported = supported;
-            status_.stateText = state;
-            status_.lastError = message;
-            status_.capabilities = capabilities;
+            status_.stateText = text(2);
+            status_.lastError = text(3);
         }
         g_variant_unref(answer);
     }
@@ -297,7 +332,8 @@ private:
         if (subscription_) g_dbus_connection_signal_unsubscribe(connection_, subscription_);
         if (keySubscription_) g_dbus_connection_signal_unsubscribe(connection_, keySubscription_);
         if (allowedSubscription_) g_dbus_connection_signal_unsubscribe(connection_, allowedSubscription_);
-        subscription_ = keySubscription_ = allowedSubscription_ = 0;
+        if (mouseAllowedSubscription_) g_dbus_connection_signal_unsubscribe(connection_, mouseAllowedSubscription_);
+        subscription_ = keySubscription_ = allowedSubscription_ = mouseAllowedSubscription_ = 0;
         g_clear_object(&connection_);
         activated_ = false;
         g_main_loop_unref(loop_);

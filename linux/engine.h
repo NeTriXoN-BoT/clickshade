@@ -18,7 +18,6 @@ struct EngineStatus {
     std::string backend;
     std::string stateText;
     std::string lastError;
-    std::string capabilities;
 };
 
 // Backends own their event processing. GUI updates never perform work inside

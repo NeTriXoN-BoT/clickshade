@@ -43,6 +43,16 @@ if [ "${1:-}" = "--test" ]; then
     "$task_build/frame_pacing_test"
     # shellcheck disable=SC2086
     "$cxx" -std=c++17 -O2 -Wall -Wextra -Wpedantic ${CXXFLAGS:-} \
+        -I"$task_root/src" "$task_root/tests/ui_scale_test.cpp" \
+        -o "$task_build/ui_scale_test" ${LDFLAGS:-}
+    "$task_build/ui_scale_test"
+    # shellcheck disable=SC2086
+    "$cxx" -std=c++17 -O2 -Wall -Wextra -Wpedantic ${CXXFLAGS:-} \
+        "$task_root/linux/tests/game_detection_test.cpp" \
+        -o "$task_build/game_detection_test" ${LDFLAGS:-}
+    "$task_build/game_detection_test"
+    # shellcheck disable=SC2086
+    "$cxx" -std=c++17 -O2 -Wall -Wextra -Wpedantic ${CXXFLAGS:-} \
         $("$pkg_config" --cflags glib-2.0) \
         "$task_root/linux/self_test.cpp" "$task_root/linux/settings.cpp" \
         -o "$task_build/settings_test" $("$pkg_config" --libs glib-2.0) ${LDFLAGS:-}
@@ -61,4 +71,15 @@ if [ "${1:-}" = "--test" ]; then
         "$task_root/linux/gnome_adapter.cpp" "$task_root/linux/audio.cpp" \
         -o "$task_build/gnome_queue_smoke" $("$pkg_config" --libs gio-2.0) -ldl ${LDFLAGS:-}
     "$task_build/gnome_queue_smoke"
+    # The shortcut parser check links XTest, which the normal build does not need.
+    if "$pkg_config" --exists xtst; then
+        # shellcheck disable=SC2086
+        "$cxx" -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic ${CXXFLAGS:-} \
+            $("$pkg_config" --cflags $modules xtst) -I"$task_root/linux" \
+            "$task_root/linux/tests/hotkeys_smoke.cpp" "$task_root/linux/hotkeys.cpp" \
+            -o "$task_build/hotkeys_smoke" $("$pkg_config" --libs $modules xtst) ${LDFLAGS:-}
+        "$task_build/hotkeys_smoke" --headless
+    else
+        echo 'Skipping the shortcut parser test: install the XTest development package (xtst).'
+    fi
 fi

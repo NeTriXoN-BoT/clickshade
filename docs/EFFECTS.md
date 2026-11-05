@@ -7,7 +7,7 @@ private operating-system animation or every recorder's renderer.
 
 | Effect | Controls | Windows | Linux X11 | GNOME Wayland companion |
 | --- | --- | --- | --- | --- |
-| Pointer highlight | Filled, ring, glow, crosshair or spotlight; color, radius, opacity, width; breathing; hide when idle | Yes | Yes | Experimental (spotlight drawn as a glow) |
+| Pointer highlight | Filled, ring, glow, crosshair or spotlight; color, radius, opacity, width; breathing; hide when idle | Yes; breathing is a 3.2 s opacity pulse | Yes; breathing is a 2.6 s swell of radius and opacity | Experimental (spotlight drawn as a glow; breathing as on X11) |
 | Click feedback | Left/right/middle colors; ring, pulse, ripple, burst, neon ring or target; duration, radius, opacity, easing | Yes | Yes | Experimental |
 | Keyboard sounds | Set folders with shuffled key variants plus space/enter/backspace; own volume and shortcut | Raw Input key category only while enabled | XI2 raw key category only while enabled | Category over D-Bus from the extension |
 | Cursor trails | Dots, rings, sparkles, Comet, Fine sparkle; color/size/fade | Yes | Yes | Unavailable |
@@ -17,7 +17,7 @@ private operating-system animation or every recorder's renderer.
 | Plasma-style shake locator | Sensitivity, maximum scale | Cached native arrow | Cached current cursor overlay | Use compositor facilities |
 | macOS-inspired shake locator | Sensitivity, maximum scale | Cached native arrow | Cached current cursor overlay | Use compositor facilities |
 | Click sounds | Left/right/middle, 33 templates in eleven sets, custom files, volume | WAV and installed codecs through WASAPI (waveOut fallback) | WAV | WAV through running bridge |
-| Magnifier lens | Zoom 125–800 %, size, round or rounded square, centered or beside, frame color or no frame | Magnification API window; own overlays excluded; live while resting | Beside the pointer, read from the screen about 30 times a second | Square lens beside the pointer, cloned from the window layer |
+| Magnifier lens | Zoom 125–800 %, size, round or rounded square, centered or beside, frame color or no frame | Magnification API window; own overlays excluded; live while resting | Beside the pointer, read from the screen as the pointer moves and about 30 times a second at rest | Square lens beside the pointer, cloned from the window layer |
 | Key display | Shortcuts only or every key, mouse buttons, four positions, size, hold time, opacity, backdrop | Raw Input while enabled; keycaps and typed words only in memory while shown | XI2 raw keys while enabled; same rows | Shell captured events; St keycaps |
 | Capture visibility | Show or hide every overlay in recordings and screenshots | Display affinity (Windows 10 version 2004 or later) | Always captured | Always captured |
 
@@ -65,7 +65,7 @@ presentation features supplied by independent Mac utilities.
 | Mouseposé-style per-button click colors and sounds | Independent left/right animation colors, plus left/right/middle sound files and templates. ClickShade does not count double/triple clicks as separate numbered indicators. |
 | Cursor Pro-style highlight customization | Radius, opacity, ring width and colors; five optional trails. The ClickShade halo is circular, not every shape from that app. |
 | Screen-dimming spotlight and magnifying lens | The Spotlight highlight style dims the pointer's monitor around a clear circle, and the Presenter page adds a magnifier lens (round or square, centered or beside the pointer, 1.25–8×). On Windows the lens is a Magnification API window, so no screen capture service of ClickShade's own is involved. |
-| Camtasia-style cursor scale | **Cursor scale** enlarges the pointer like the scale slider of screen-recording editors, but live, on every pointer role and measured from Windows' own pointer size. Each size is redrawn from the sharpest source image instead of stretching one bitmap. The cursor look adds the editors' opacity, drop shadow and color options to the live pointer, and the **Target** click style closes in on the click like their scope-style click effect. |
+| Camtasia-style cursor scale | **Cursor scale** enlarges the pointer like the scale slider of screen-recording editors, but live, on every pointer role and measured from Windows' own pointer size. Each size is redrawn from the sharpest source image instead of stretching one bitmap, and installed with an image for every size Windows draws it at, so it stays crisp at any pointer size and display scaling. The cursor look adds the editors' opacity, drop shadow and color options to the live pointer, and the **Target** click style closes in on the click like their scope-style click effect. |
 | On-screen keystrokes | The Presenter page's key display shows shortcuts as keycaps on rounded panels, typed words in every-key mode, and optional mouse buttons, in the style of the Mac keystroke visualizers. Rows exist only while shown; there is no typing recorder. |
 | Annotation and whiteboard | Outside this release's scope. |
 

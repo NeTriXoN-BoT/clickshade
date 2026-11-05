@@ -1,7 +1,10 @@
 // Explicit interactive-desktop integration checks for the overlay renderer.
 // Close ClickShade, then run visual_smoke.exe --run. This briefly moves the
-// pointer and sends clicks inside its own test window. Screenshots are written
-// to the current directory. Wine results do not establish native-game behavior.
+// pointer, sends clicks inside its own test window and presses F24, a key
+// without a standard function, to stand in for typing. Leave the mouse and
+// keyboard alone meanwhile. Screenshots are written beside visual_smoke.exe.
+// Wine results do not establish native-game behavior.
+#include "pointer_visibility.h"
 #include "visual_effects.h"
 
 #include <algorithm>
@@ -268,7 +271,15 @@ struct Screenshot {
         const auto value = pixels[static_cast<std::size_t>(y) * width + x];
         return RGB((value >> 16) & 255, (value >> 8) & 255, value & 255);
     }
-    bool Save(const wchar_t* path) const {
+    // Captures go beside the executable, never into whatever folder the test
+    // was started from (such as the source tree).
+    bool Save(const wchar_t* name) const {
+        wchar_t module[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, module, MAX_PATH);
+        std::wstring path(module, length < MAX_PATH ? length : 0);
+        const std::size_t slash = path.find_last_of(L"\\/");
+        path.resize(slash == std::wstring::npos ? 0 : slash + 1);
+        path += name;
         BITMAPFILEHEADER file{};
         BITMAPINFOHEADER info{};
         info.biSize = sizeof(info);
@@ -280,7 +291,7 @@ struct Screenshot {
         file.bfType = 0x4d42;
         file.bfOffBits = sizeof(file) + sizeof(info);
         file.bfSize = file.bfOffBits + info.biSizeImage;
-        HANDLE output = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        HANDLE output = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                     FILE_ATTRIBUTE_NORMAL, nullptr);
         if (output == INVALID_HANDLE_VALUE) return false;
         DWORD written = 0;
@@ -317,6 +328,17 @@ void SendClick(bool right) {
     input[1].mi.dwFlags = right ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
     Require(SendInput(2, input, sizeof(INPUT)) == 2, "mouse click is injected into the test desktop");
     PumpFor(80);
+}
+
+// Typing as the renderer can see it: GetLastInputInfo reports a new input
+// with no pointer motion since. F24 has no standard function.
+void SendHarmlessKey() {
+    INPUT input[2]{};
+    input[0].type = input[1].type = INPUT_KEYBOARD;
+    input[0].ki.wVk = input[1].ki.wVk = VK_F24;
+    input[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    Require(SendInput(2, input, sizeof(INPUT)) == 2, "a key press is injected into the test desktop");
+    PumpFor(20);
 }
 
 double ClockSeconds() {
@@ -745,6 +767,18 @@ void CheckKeyDisplay(clickshade::VisualEffects& effects, clickshade::Settings& s
     effects.PreviewKey();
     PumpFor(90);
     Check(Overlays().size() == 1, "the sample label shows while the switch is off");
+    panels = Overlays();
+    GetWindowRect(panels.empty() ? nullptr : panels[0], &bounds);
+    const int sampleWidth = bounds.right - bounds.left;
+    settings.keyDisplaySize = 150;
+    effects.UpdateSettings(settings);
+    PumpFor(60);
+    panels = Overlays();
+    GetWindowRect(panels.empty() ? nullptr : panels[0], &bounds);
+    Check(panels.size() == 1 && bounds.right - bounds.left > sampleWidth,
+          "a sample shown with the switch off stays and takes a changed text size");
+    settings.keyDisplaySize = 100;
+    effects.UpdateSettings(settings);
     PumpFor(600 + 350 + 200);
     Check(Overlays().empty(), "the sample label fades like a real one");
 }
@@ -753,10 +787,11 @@ unsigned Luma(COLORREF color) {
     return (GetRValue(color) * 299u + GetGValue(color) * 587u + GetBValue(color) * 114u) / 1000u;
 }
 
+// The renderer's own rule, transparent cursors included.
 bool PointerShown() {
     CURSORINFO cursor{};
     cursor.cbSize = sizeof(cursor);
-    return GetCursorInfo(&cursor) && (cursor.flags & CURSOR_SHOWING) && !(cursor.flags & CURSOR_SUPPRESSED) && cursor.hCursor;
+    return GetCursorInfo(&cursor) && clickshade::PointerVisible(cursor);
 }
 
 void CheckSpotlight(clickshade::VisualEffects& effects, clickshade::Settings& settings, const Host& host) {
@@ -815,16 +850,37 @@ void CheckSpotlight(clickshade::VisualEffects& effects, clickshade::Settings& se
         const Screenshot shot(host.Bounds());
         Check(Luma(shot.At(moved)) >= Luma(shot.At(center)) * 2 + 6, "the circle follows the pointer and its old place is dimmed again");
     }
+    // A pointer hidden while nobody types (a video player after a few idle
+    // seconds) takes the spotlight with it.
     effects.SetAllowed(false, true);
     PumpFor(60);
-    Check(Overlays().size() == 1, "the spotlight stays in place while an application hides the pointer for typing");
+    Check(Overlays().empty(), "the spotlight hides with a pointer an application hides while nobody types");
+    effects.SetAllowed(true);
+    effects.PointerActivity();
+    PumpFor(90);
+    Check(Overlays().size() == 1, "the spotlight returns with the pointer");
+    // A key press just before the pointer disappears is typing: it waits.
+    SendHarmlessKey();
+    effects.SetAllowed(false, true);
+    PumpFor(60);
+    windows = Overlays();
+    Check(windows.size() == 1 && windows[0] == layer, "the spotlight stays in place while the user types with the pointer hidden");
     effects.SetAllowed(false, false);
     PumpFor(60);
-    Check(Overlays().empty(), "pausing the effects hides the spotlight in one step");
+    Check(Overlays().empty(), "pausing the effects hides a held spotlight in one step");
     effects.SetAllowed(true);
     effects.PointerActivity();
     PumpFor(90);
     Check(Overlays().size() == 1, "the spotlight returns when the effects are allowed again");
+    SendHarmlessKey();
+    effects.SetAllowed(false, true);
+    PumpFor(3400);
+    Check(Overlays().empty() && !effects.Stats().framePending,
+          "the typing hold ends a few seconds after the last input and leaves no frame timer");
+    effects.SetAllowed(true);
+    effects.PointerActivity();
+    PumpFor(90);
+    Check(Overlays().size() == 1, "the spotlight returns once the pointer shows again");
     settings.highlightStyle = clickshade::kHighlightRing;
     effects.UpdateSettings(settings);
     PumpFor(90);
@@ -923,6 +979,18 @@ void CheckMagnifier(clickshade::VisualEffects& effects, clickshade::Settings& se
     const auto refreshed = effects.Stats();
     PumpFor(200);
     Check(effects.Stats().magnifierUpdates > refreshed.magnifierUpdates, "a resting lens keeps refreshing so live content stays current");
+    // Move after the injected click, so the newest input is pointer motion.
+    host.Move(380, 230);
+    effects.PointerActivity();
+    PumpFor(120);
+    effects.SetAllowed(false, true);
+    PumpFor(80);
+    Check(LensHosts().empty() && !effects.Stats().magnifierVisible,
+          "the lens hides with a pointer an application hides while nobody types");
+    effects.SetAllowed(true);
+    effects.PointerActivity();
+    PumpFor(150);
+    Check(LensHosts().size() == 1, "the lens returns with the pointer");
     stripe = {};
     InvalidateRect(host.window, nullptr, FALSE);
     settings.magnifierEnabled = false;
@@ -1084,6 +1152,14 @@ void RunChecks() {
     Check(axisTick > 0 && diagonalRing > 0 && axisTick < diagonalRing * 1.41421 * 0.8,
           "the target click draws inward ticks on its axes, inside its ring");
     Check(target.Save(L"visual-qa-click-target.bmp"), "target click screenshot is saved");
+    {
+        // The ring starts at the full radius with half its line outside it.
+        const auto rings = Overlays();
+        RECT ring{};
+        const int clickRadius = static_cast<int>((settings.clickRadius * effects.Stats().monitorDpi + 48) / 96);
+        Check(rings.size() == 1 && GetWindowRect(rings[0], &ring) && ring.right - ring.left > clickRadius * 2 + 7,
+              "the target click window has room for the ring's line beyond its radius");
+    }
     PumpFor(1250);
     Check(Overlays().empty(), "a completed target click hides its window");
 

@@ -33,11 +33,37 @@ bool Label(unsigned key, unsigned scan, bool extended, unsigned modifiers, const
     if (actual != expected) std::printf("INFO expected \"%s\" but got \"%s\"\n", Narrow(expected).c_str(), Narrow(actual).c_str());
     return actual == expected;
 }
+
+// The expected characters are those of the US layout, so the checks use it
+// whatever layout the host has active (AZERTY types 'è' for 7, Cyrillic has
+// no 'A'). An already loaded US layout is reused; otherwise one is loaded
+// without activating it and unloaded again, so the session's own layout
+// list ends as it began.
+struct UsLayout {
+    HKL layout = nullptr;
+    bool loaded = false;
+    UsLayout() {
+        HKL existing[64]{};
+        const int count = GetKeyboardLayoutList(64, existing);
+        for (int i = 0; i < count && !layout; ++i)
+            if (HIWORD(reinterpret_cast<ULONG_PTR>(existing[i])) == 0x0409) layout = existing[i];
+        if (layout) return;
+        layout = LoadKeyboardLayoutW(L"00000409", KLF_NOTELLSHELL);
+        loaded = layout != nullptr;
+        for (int i = 0; i < count && loaded; ++i) loaded = existing[i] != layout;
+    }
+    UsLayout(const UsLayout&) = delete;
+    UsLayout& operator=(const UsLayout&) = delete;
+    ~UsLayout() { if (loaded) UnloadKeyboardLayout(layout); }
+};
 } // namespace
 
 int wmain() {
     using namespace clickshade;
-    const HKL layout = GetKeyboardLayout(0);
+    Check(!KeyName('A', 0x1e, false, 0, GetKeyboardLayout(0)).empty(), "the active layout labels a letter key");
+    const UsLayout us;
+    Check(us.layout != nullptr, "the US keyboard layout is available for the layout-specific checks");
+    const HKL layout = us.layout ? us.layout : GetKeyboardLayout(0);
     Check(Label('A', 0x1e, false, 0, L"A", layout), "a letter key is labelled with its upper-case character");
     Check(Label('7', 0x08, false, 0, L"7", layout), "a digit key is labelled with the digit");
     Check(Label(VK_F5, 0x3f, false, 0, L"F5", layout), "function keys use their F names");

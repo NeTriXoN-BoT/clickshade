@@ -7,8 +7,10 @@
 #include "win_event_listener.h"
 #include "shake_locator.h"
 #include "frame_pacing.h"
+#include "pointer_visibility.h"
 
 #include <dwmapi.h>
+#include <shellapi.h>
 #include <wtsapi32.h>
 #include <algorithm>
 #include <array>
@@ -24,6 +26,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace clickshade {
@@ -150,8 +153,11 @@ bool IsCursorConfined(bool shellWindow) {
            clip.right < right - 2 || clip.bottom < bottom - 2;
 }
 
-std::wstring ProcessName(DWORD processId, InputTokenFacts& tokenFacts) {
+// Returns the executable's basename; fullPath receives its full image path,
+// or stays empty when the process cannot be inspected.
+std::wstring ProcessName(DWORD processId, InputTokenFacts& tokenFacts, std::wstring& fullPath) {
     tokenFacts = {};
+    fullPath.clear();
     if (!processId) return {};
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
     if (!process) return L"(process unavailable)";
@@ -161,10 +167,63 @@ std::wstring ProcessName(DWORD processId, InputTokenFacts& tokenFacts) {
     const BOOL success = QueryFullProcessImageNameW(process, 0, path.data(), &length);
     CloseHandle(process);
     if (!success) return L"(process unavailable)";
-    std::wstring name(path.data(), length);
+    fullPath.assign(path.data(), length);
+    std::wstring name = fullPath;
     const auto slash = name.find_last_of(L"\\/");
     if (slash != std::wstring::npos) name.erase(0, slash + 1);
     return name;
+}
+
+// Paths compare case-insensitively like the file system, beyond ASCII too.
+std::wstring FoldPath(std::wstring path) {
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    if (!path.empty()) CharLowerBuffW(path.data(), static_cast<DWORD>(path.size()));
+    return path;
+}
+
+// Folders that game stores and launchers install games into.
+constexpr const wchar_t* kGameLibraryFolders[] = {
+    L"\\steamapps\\common\\", L"\\epic games\\", L"\\gog galaxy\\games\\", L"\\gog games\\",
+    L"\\origin games\\", L"\\ea games\\", L"\\ubisoft game launcher\\games\\", L"\\riot games\\",
+    L"\\xboxgames\\", L"\\rockstar games\\", L"\\amazon games\\library\\", L"\\itch\\apps\\"};
+
+bool InGameLibrary(const std::wstring& foldedPath) {
+    for (const wchar_t* folder : kGameLibraryFolders)
+        if (foldedPath.find(folder) != std::wstring::npos) return true;
+    return false;
+}
+
+// Windows Game Bar records each executable it identified as a game. The
+// list is only read, never changed, and is bounded so a huge store cannot
+// stall the input thread.
+std::unordered_set<std::wstring> ReadRegisteredGames() {
+    std::unordered_set<std::wstring> games;
+    HKEY children = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"System\\GameConfigStore\\Children", 0,
+                      KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &children) != ERROR_SUCCESS) return games;
+    std::array<wchar_t, 256> name; // Registry key names are at most 255 characters.
+    std::vector<wchar_t> value(1024);
+    for (DWORD index = 0; index < 4096; ++index) {
+        DWORD nameLength = static_cast<DWORD>(name.size());
+        const LSTATUS listed = RegEnumKeyExW(children, index, name.data(), &nameLength,
+                                             nullptr, nullptr, nullptr, nullptr);
+        if (listed == ERROR_MORE_DATA) continue;
+        if (listed != ERROR_SUCCESS) break;
+        DWORD bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+        LSTATUS read = RegGetValueW(children, name.data(), L"MatchedExeFullPath", RRF_RT_REG_SZ,
+                                    nullptr, value.data(), &bytes);
+        if (read == ERROR_MORE_DATA && bytes <= 32768 * sizeof(wchar_t)) {
+            value.resize(bytes / sizeof(wchar_t) + 1);
+            bytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+            read = RegGetValueW(children, name.data(), L"MatchedExeFullPath", RRF_RT_REG_SZ,
+                                nullptr, value.data(), &bytes);
+        }
+        if (read != ERROR_SUCCESS) continue;
+        std::wstring path(value.data(), wcsnlen(value.data(), std::min<std::size_t>(value.size(), bytes / sizeof(wchar_t))));
+        if (!path.empty()) games.insert(FoldPath(std::move(path)));
+    }
+    RegCloseKey(children);
+    return games;
 }
 
 unsigned AsyncHeldButtons() {
@@ -255,8 +314,13 @@ CursorAppearance AppearanceFrom(const Settings& settings) {
     return appearance;
 }
 
+// A cursor refresh restores and rebuilds every cursor, so skip the frequent
+// broadcasts that cannot change cursor images.
 bool KnownUnrelatedSetting(WPARAM action, LPARAM section) {
     switch (action) {
+    case SPI_SETCURSORS:
+    case SPI_SETHIGHCONTRAST:
+        return false;
     case SPI_SETBEEP:
     case SPI_SETDESKWALLPAPER:
     case SPI_SETDESKPATTERN:
@@ -267,13 +331,26 @@ bool KnownUnrelatedSetting(WPARAM action, LPARAM section) {
     case SPI_SETDOUBLECLKHEIGHT:
     case SPI_SETKEYBOARDSPEED:
     case SPI_SETKEYBOARDDELAY:
+    case SPI_SETWORKAREA: // Taskbar or app-bar resize, monitor attach.
+    case SPI_SETSCREENSAVEACTIVE: // Media players toggle it during playback.
+    case SPI_SETSCREENSAVETIMEOUT:
+    case SPI_SETSCREENSAVESECURE:
+    case SPI_SETWHEELSCROLLLINES:
+    case SPI_SETWHEELSCROLLCHARS:
         return true;
     default:
-        // Unknown broadcasts still refresh the cursor cache, including the
-        // accessibility/control-panel paths used by different Windows builds.
-        return !action && section &&
-            _wcsicmp(reinterpret_cast<const wchar_t*>(section), L"Environment") == 0;
+        break;
     }
+    if (!section) return false;
+    // Environment edits, theme/accent colors (also from wallpaper slideshows),
+    // group policy refreshes (machine policy arrives with wParam 1), taskbar
+    // and regional settings. Unknown broadcasts still refresh the cursor
+    // cache, including the accessibility/control-panel paths used by
+    // different Windows builds.
+    const auto* name = reinterpret_cast<const wchar_t*>(section);
+    for (const wchar_t* unrelated : {L"Environment", L"ImmersiveColorSet", L"Policy", L"TraySettings", L"intl"})
+        if (_wcsicmp(name, unrelated) == 0) return true;
+    return false;
 }
 } // namespace
 
@@ -336,6 +413,7 @@ struct Runtime::Impl {
     bool inputBatchActive = false;
     bool statusDirty = false;
     bool pointerActivityPending = false;
+    bool mouseInputPending = false; // Any mouse record in the current raw batch.
     bool statusTimerArmed = false;
     bool pulseTimerArmed = false;
     bool engineActive = false;
@@ -352,6 +430,20 @@ struct Runtime::Impl {
     ULONGLONG pulseUntil = 0;
     HWND foregroundWindow = nullptr;
     DWORD foregroundProcessId = 0;
+    // Pause in fullscreen applies to games only. The executable-path answer
+    // holds for the foreground process; exclusive fullscreen is live state.
+    std::wstring foregroundPath; // Folded full image path; empty when unavailable.
+    bool foregroundGame = false;
+    bool exclusiveFullscreen = false;
+    bool gameChecked = false;
+    ULONGLONG gameCheckedAt = 0;
+    std::unordered_set<std::wstring> registeredGames;
+    bool registeredGamesRead = false;
+    bool registeredGamesReadForForeground = false;
+    ULONGLONG registeredGamesReadAt = 0;
+    bool notificationStateLoaded = false;
+    using NotificationStateFunction = HRESULT (WINAPI*)(QUERY_USER_NOTIFICATION_STATE*);
+    NotificationStateFunction notificationState = nullptr;
     LARGE_INTEGER frequency{};
     ShakeLocator shake;
     AdaptiveFramePacer shakePacer;
@@ -586,7 +678,7 @@ struct Runtime::Impl {
             return;
         }
         if (AnyModifierDown()) modifierChordUsed = true;
-        if (servicesInitialized && settings.keyboardSoundsEnabled && MayApply())
+        if (servicesInitialized && settings.keyboardSoundsEnabled && MayApply(true))
             audio.Key(KeyCategoryOf(key.VKey));
         ShowKey(key.VKey, key.MakeCode, extended, CurrentModifiers());
     }
@@ -594,7 +686,7 @@ struct Runtime::Impl {
     void UpdateStateText() {
         state.pressed = engine.IsPressed();
         state.pausedByRule = excluded || (!alwaysAllowed &&
-                            ((settings.pauseFullscreen && state.fullscreen) ||
+                            ((settings.pauseFullscreen && state.fullscreenGame) ||
                              (settings.pauseConfinedCursor && state.cursorConfined))) || !cursorVisible;
         if (!state.ready) state.stateText = state.lastError.empty() ? L"Cursor engine stopped." : L"Paused after an error. Use Reload cursors to retry.";
         else if (!settings.enabled) state.stateText = L"Disabled. Your normal cursors are restored.";
@@ -602,7 +694,7 @@ struct Runtime::Impl {
         else if (suspended) state.stateText = L"Paused while Windows is suspended.";
         else if (!inputDesktopActive) state.stateText = L"Paused while this desktop is inactive.";
         else if (excluded) state.stateText = L"Paused for this excluded app.";
-        else if (!alwaysAllowed && settings.pauseFullscreen && state.fullscreen) state.stateText = L"Paused by your fullscreen rule.";
+        else if (!alwaysAllowed && settings.pauseFullscreen && state.fullscreenGame) state.stateText = L"Paused in this fullscreen game.";
         else if (!alwaysAllowed && settings.pauseConfinedCursor && state.cursorConfined) state.stateText = L"Paused because this app confines the pointer.";
         else if (!cursorVisible) state.stateText = L"Paused while this app hides the pointer.";
         else if (!settings.darkCursorEnabled) state.stateText = L"Ready. Cursor darkening is switched off.";
@@ -611,15 +703,6 @@ struct Runtime::Impl {
         else if (state.pressed) state.stateText = L"Button held. Supported Windows cursors use the pressed appearance.";
         else if (!settings.cursorHold) state.stateText = L"Ready. Press a selected mouse button for a short cursor pulse.";
         else state.stateText = L"Ready. Hold a selected mouse button to use the pressed cursor.";
-    }
-
-    void RecordUpdate(const LARGE_INTEGER& begin) {
-        LARGE_INTEGER end{};
-        QueryPerformanceCounter(&end);
-        state.lastUpdateMicroseconds = frequency.QuadPart > 0 ?
-            static_cast<double>(end.QuadPart - begin.QuadPart) * 1000000.0 /
-            static_cast<double>(frequency.QuadPart) : 0.0;
-        ++state.updateCount;
     }
 
     void SetReleaseTimer() {
@@ -639,7 +722,9 @@ struct Runtime::Impl {
         if (servicesInitialized) {
             visuals.SetAllowed(false);
             audio.SetAllowed(false);
+            audio.SetKeyboardAllowed(false);
             servicesAllowed = false;
+            keyServicesAllowed = false;
         }
         std::wstring restorationError;
         engine.Restore(restorationError);
@@ -656,29 +741,37 @@ struct Runtime::Impl {
         Publish();
     }
 
-    bool RestoreAndClear() {
+    // Restores the native cursors but keeps the held-button bookkeeping, so a
+    // cursor refresh during a drag re-applies the pressed cursor afterwards
+    // and the real release still arrives from a known device.
+    bool RestoreCursors() {
         CancelShake();
         CancelPulse();
-        devices.clear();
-        state.heldButtons = 0;
-        SetReleaseTimer();
         std::wstring error;
         const bool wasActive = engineActive || engine.IsPressed();
-        LARGE_INTEGER begin{};
-        if (wasActive) QueryPerformanceCounter(&begin);
         if (!engine.Restore(error)) { Fail(error); return false; }
         engineActive = false;
-        if (wasActive) RecordUpdate(begin);
+        if (wasActive) ++state.updateCount;
         state.pressed = false;
         return true;
     }
 
-    // ignoreHiddenPointer: the key display keeps working while an application
-    // hides the pointer, which editors do while you type.
+    // Also forgets held buttons: used where their releases are not delivered
+    // (lock, suspend, inactive desktop) or the runtime is shutting down.
+    bool RestoreAndClear() {
+        devices.clear();
+        state.heldButtons = 0;
+        SetReleaseTimer();
+        return RestoreCursors();
+    }
+
+    // ignoreHiddenPointer: the key display, keyboard sounds and the installed
+    // cursor baseline keep working while an application hides the pointer,
+    // which editors do while you type.
     bool MayApply(bool ignoreHiddenPointer = false) const {
         return state.ready && settings.enabled && !state.sessionLocked && !suspended &&
                inputDesktopActive && (cursorVisible || ignoreHiddenPointer) && !excluded &&
-               (alwaysAllowed || (!(settings.pauseFullscreen && state.fullscreen) &&
+               (alwaysAllowed || (!(settings.pauseFullscreen && state.fullscreenGame) &&
                                   !(settings.pauseConfinedCursor && state.cursorConfined)));
     }
 
@@ -703,8 +796,20 @@ struct Runtime::Impl {
     void UpdateEffect(bool refreshOverlay = false, unsigned clicks = 0, unsigned cursorTriggers = 0) {
         const bool allowed = MayApply();
         const bool keysAllowed = MayApply(true);
-        const bool active = allowed && (settings.darkCursorEnabled || settings.shakeStyle != 0 || CursorCustomized(settings));
-        if (!allowed || !settings.shakeStyle) CancelShake();
+        // A hidden pointer pauses press, pulse and shake only. The configured
+        // cursors stay installed: invisible while hidden, and it avoids a full
+        // restore and reinstall (with a visible flash) on every hide/show.
+        const bool active = keysAllowed && (settings.darkCursorEnabled || settings.shakeStyle != 0 || CursorCustomized(settings));
+        if (!allowed || !settings.shakeStyle) {
+            const bool magnified = locatorScale.load(std::memory_order_relaxed) != 1.f;
+            CancelShake();
+            // With the cursors still installed, an enlarged locator must
+            // shrink here; SetActive(false) below would restore it anyway.
+            if (magnified && engineActive && active) {
+                std::wstring error;
+                if (!engine.SetMagnification(1.f, error)) { Fail(error); return; }
+            }
+        }
         if (!allowed || !settings.darkCursorEnabled || settings.cursorHold) CancelPulse();
         else if (cursorTriggers && !StartPulse()) return;
         if (servicesInitialized && (allowed != servicesAllowed || keysAllowed != keyServicesAllowed || refreshOverlay)) {
@@ -712,6 +817,7 @@ struct Runtime::Impl {
             // Reasserting overlay z-order does not require waking an idle
             // audio worker when its permission is already unchanged.
             if (allowed != servicesAllowed) audio.SetAllowed(allowed);
+            if (keysAllowed != keyServicesAllowed) audio.SetKeyboardAllowed(keysAllowed);
             servicesAllowed = allowed;
             keyServicesAllowed = keysAllowed;
         }
@@ -723,21 +829,18 @@ struct Runtime::Impl {
         }
         if (engineActive != active) {
             std::wstring error;
-            LARGE_INTEGER begin{};
-            QueryPerformanceCounter(&begin);
             if (!engine.SetActive(active, error)) { Fail(error); return; }
             engineActive = active;
-            RecordUpdate(begin);
+            ++state.updateCount;
         }
-        const bool shouldPress = active && settings.darkCursorEnabled && (settings.cursorHold
+        // allowed implies active whenever darkening is on.
+        const bool shouldPress = allowed && settings.darkCursorEnabled && (settings.cursorHold
             ? (state.heldButtons & settings.buttonMask) != 0
             : pulseUntil != 0 && GetTickCount64() < pulseUntil);
         if (engine.IsPressed() != shouldPress) {
             std::wstring error;
-            LARGE_INTEGER begin{};
-            QueryPerformanceCounter(&begin);
             if (!engine.SetPressed(shouldPress, error)) { Fail(error); return; }
-            RecordUpdate(begin);
+            ++state.updateCount;
         }
         Publish();
     }
@@ -841,22 +944,80 @@ struct Runtime::Impl {
         state.cursorConfined = IsCursorConfined(foregroundIsShell);
         CURSORINFO cursor{};
         cursor.cbSize = sizeof(cursor);
-        cursorVisible = GetCursorInfo(&cursor) && (cursor.flags & CURSOR_SHOWING) != 0 &&
-                        !(cursor.flags & CURSOR_SUPPRESSED) && cursor.hCursor;
+        // Beyond ShowCursor and null cursors (Chromium), a fully transparent
+        // cursor (Firefox's CSS cursor:none) also hides the pointer. A switch
+        // to it while the mouse rests arrives as a cursor shape WinEvent.
+        cursorVisible = GetCursorInfo(&cursor) && PointerVisible(cursor);
         lastInputRuleCheck = GetTickCount64();
         return previousConfined != state.cursorConfined || previousVisible != cursorVisible;
     }
 
-    void RefreshForegroundFacts() {
+    // SHQueryUserNotificationState lives in shell32, which the runtime only
+    // needs once a fullscreen window shows up. The app links shell32 anyway;
+    // it is never unloaded, since its worker threads may outlive this call.
+    bool ExclusiveFullscreenRunning() {
+        if (!notificationStateLoaded) {
+            notificationStateLoaded = true;
+            HMODULE shell = GetModuleHandleW(L"shell32.dll");
+            if (!shell) shell = LoadLibraryExW(L"shell32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (shell) {
+                const FARPROC address = GetProcAddress(shell, "SHQueryUserNotificationState");
+                static_assert(sizeof(address) == sizeof(notificationState), "Windows function pointer size");
+                std::memcpy(&notificationState, &address, sizeof(address));
+            }
+        }
+        QUERY_USER_NOTIFICATION_STATE notification{};
+        return notificationState && SUCCEEDED(notificationState(&notification)) &&
+               notification == QUNS_RUNNING_D3D_FULL_SCREEN;
+    }
+
+    // Called only for a fullscreen foreground window. Browsers, video players
+    // and presentations keep their effects; a game is an exclusive fullscreen
+    // Direct3D app, an executable that Game Bar lists as a game, or one
+    // inside a game store's library folder.
+    bool FullscreenGame(bool clickPath) {
+        if (foregroundGame) return true;
+        const ULONGLONG now = GetTickCount64();
+        // Window and foreground events always re-check; clicks reuse the
+        // last answer for up to a second.
+        if (clickPath && gameChecked && now - gameCheckedAt < 1000) return exclusiveFullscreen;
+        gameChecked = true;
+        gameCheckedAt = now;
+        if (!foregroundPath.empty()) {
+            // Game Bar adds a game shortly after its first launch, so refresh
+            // the list at most once a minute, and from the click path at most
+            // once per foreground process.
+            const bool stale = !registeredGamesRead || now - registeredGamesReadAt >= 60000;
+            if (stale && (!clickPath || !registeredGamesReadForForeground)) {
+                registeredGames = ReadRegisteredGames();
+                registeredGamesRead = true;
+                registeredGamesReadForForeground = true;
+                registeredGamesReadAt = now;
+            }
+            if (registeredGames.count(foregroundPath)) return foregroundGame = true;
+        }
+        exclusiveFullscreen = ExclusiveFullscreenRunning();
+        return exclusiveFullscreen;
+    }
+
+    // clickPath: called on a button press, where repeated work must stay cheap.
+    void RefreshForegroundFacts(bool clickPath = false) {
         HWND window = GetForegroundWindow();
         if (window) window = GetAncestor(window, GA_ROOT);
         DWORD processId = 0;
         if (window) GetWindowThreadProcessId(window, &processId);
-        if (window != foregroundWindow || processId != foregroundProcessId)
+        if (window != foregroundWindow || processId != foregroundProcessId) {
             foregroundIsShell = IsShellWindowLike(window);
+            gameChecked = false;
+            exclusiveFullscreen = false;
+        }
         if (processId != foregroundProcessId || !foregroundWindow) {
             InputTokenFacts foregroundTokenFacts;
-            state.foregroundProcess = ProcessName(processId, foregroundTokenFacts);
+            std::wstring path;
+            state.foregroundProcess = ProcessName(processId, foregroundTokenFacts, path);
+            foregroundPath = FoldPath(std::move(path));
+            foregroundGame = InGameLibrary(foregroundPath);
+            registeredGamesReadForForeground = false;
             asyncButtonsReadable = CanReconcileAsyncButtons(ownTokenFacts, foregroundTokenFacts);
             state.foregroundElevated = processId != 0 && !asyncButtonsReadable &&
                 (!foregroundTokenFacts.integrityKnown ||
@@ -870,6 +1031,7 @@ struct Runtime::Impl {
         foregroundWindow = window;
         foregroundEventWindow.store(window);
         state.fullscreen = IsFullscreenWindow(window, foregroundIsShell);
+        state.fullscreenGame = state.fullscreen && settings.pauseFullscreen && FullscreenGame(clickPath);
         RefreshCursorRules();
         inputDesktopActive = IsInputDesktopActive();
         if (!inputDesktopActive) RestoreAndClear();
@@ -891,6 +1053,10 @@ struct Runtime::Impl {
         if (input.header.dwType != RIM_TYPEMOUSE) return;
         const USHORT flags = input.data.mouse.usButtonFlags;
         if (suspended || state.sessionLocked) return;
+        // Recorded before anything below can react to this input, so a click
+        // that hides the pointer is never taken for typing.
+        if (!mouseInputPending && servicesInitialized) visuals.MouseInput();
+        mouseInputPending = true;
         // Multiple movement samples in one buffered read need one renderer
         // wake. The renderer reads the latest screen position independently.
         if ((settings.highlightEnabled || settings.trailEnabled || settings.shakeStyle || settings.magnifierEnabled) &&
@@ -911,7 +1077,7 @@ struct Runtime::Impl {
         // click, verify it again on down in case an app omitted a resize event.
         // This fallback never runs for movement or release packets.
         if (down && (settings.pauseFullscreen || settings.pauseConfinedCursor || !exclusions.empty())) {
-            RefreshForegroundFacts();
+            RefreshForegroundFacts(true);
             if (!inputDesktopActive) { UpdateEffect(); return; }
         }
         else if (down) {
@@ -999,10 +1165,17 @@ struct Runtime::Impl {
             DrainInput(handle);
         } catch (...) {
             inputBatchActive = false;
-            pointerActivityPending = false;
+            pointerActivityPending = mouseInputPending = false;
             throw;
         }
         inputBatchActive = false;
+        // Even while the pointer is hidden: the renderer tells typing from
+        // mouse use by it (see VisualEffects::MouseInput). Once more at the
+        // end, with the batch's last record.
+        if (mouseInputPending) {
+            mouseInputPending = false;
+            if (servicesInitialized) visuals.MouseInput();
+        }
         if (pointerActivityPending) {
             pointerActivityPending = false;
             if (servicesInitialized && MayApply()) visuals.PointerActivity();
@@ -1058,7 +1231,9 @@ struct Runtime::Impl {
         }
         reloading = true;
         reloadPending = false;
-        if (!RestoreAndClear()) { reloading = false; return; }
+        // Buttons held through a refresh still release normally here, so keep
+        // them: UpdateForeground below re-applies the pressed cursor.
+        if (!RestoreCursors()) { reloading = false; return; }
         if (!CursorEngine::RestoreSystemScheme()) {
             reloading = false;
             Fail(ErrorText(L"Could not reload the Windows cursor scheme"));
@@ -1179,9 +1354,8 @@ struct Runtime::Impl {
             if (servicesInitialized) visuals.PointerActivity();
             if ((engine.IsPressed() || shake.Active(Seconds())) && MayApply() && !reloading) {
                 std::wstring error;
-                LARGE_INTEGER begin{}; QueryPerformanceCounter(&begin);
                 if (!engine.ApplyCurrent(error)) Fail(error);
-                else { RecordUpdate(begin); Publish(); }
+                else { ++state.updateCount; Publish(); }
             }
             return 0;
         case WM_TIMER:
@@ -1298,15 +1472,18 @@ struct Runtime::Impl {
         }
         sessionRegistered = true;
         inputDesktopActive = IsInputDesktopActive();
-        if (!engine.Initialize(error)) return false;
-        // A missing custom profile remains editable in the running UI. It
-        // pauses effects until a valid profile is selected, rather than making
-        // an otherwise healthy input worker impossible to start.
-        state.ready = engine.Configure(AppearanceFrom(settings), error);
+        // Build the requested profile directly; a default build first would
+        // only be thrown away. A missing custom profile remains editable in
+        // the running UI. It pauses effects until a valid profile is selected,
+        // rather than making an otherwise healthy input worker impossible to
+        // start, and the default cursors still serve previews and later retries.
+        std::wstring profileError;
+        state.ready = engine.Configure(AppearanceFrom(settings), profileError);
+        if (!state.ready && !engine.Initialize(error)) return false;
         appearanceValid = state.ready;
         engineActive = false;
         state.cursorCount = engine.CursorCount();
-        state.lastError = state.ready ? L"" : error;
+        state.lastError = state.ready ? L"" : profileError;
         RefreshPreviews();
         std::wstring optionalError;
         try {
@@ -1320,6 +1497,7 @@ struct Runtime::Impl {
         } catch (...) { state.audioError = L"Click audio could not be started."; }
         visuals.SetAllowed(false);
         audio.SetAllowed(false);
+        audio.SetKeyboardAllowed(false);
         servicesInitialized = true;
         servicesAllowed = false;
         keyServicesAllowed = false;
@@ -1332,6 +1510,7 @@ struct Runtime::Impl {
         try {
             visuals.SetAllowed(false);
             audio.SetAllowed(false);
+            audio.SetKeyboardAllowed(false);
         } catch (...) {}
         // Restore the native pointer before joining optional workers. A codec
         // or audio driver may take time to return from an in-flight call.

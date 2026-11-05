@@ -20,8 +20,14 @@ packaging. Discuss broad new features before adding dependencies or threads.
 
 Build with the documented MSVC/Zig or Linux commands. Use an isolated desktop
 for cursor/input integration tests. They may temporarily move/hide/replace the
-pointer. Do not claim Windows compatibility from a Wine pass, audible playback
-from decoder tests, or Wayland compatibility from JavaScript syntax checks.
+pointer; the Windows runtime suite also opens a fullscreen window and a
+fullscreen test "game" (a copy of itself in a temporary Steam-style folder under
+`%TEMP%`), and the overlay suite presses F24 and writes its BMP screenshots
+beside its own executable (`visual_smoke.exe` from the Zig build,
+`ClickShadeVisualTest.exe` from CMake). Leave the mouse and keyboard alone while
+they run, and close ClickShade first. Do not claim Windows compatibility from a
+Wine pass, audible playback from decoder tests, or Wayland compatibility from
+JavaScript syntax checks.
 
 Keep input handling free of file I/O, decoding, GUI work, and unbounded queues.
 Keep overlays non-activating and input-transparent. Restore owned cursor state
@@ -31,7 +37,12 @@ settings as a shortcut for runtime effects.
 A pull request should explain the concrete problem, changed behavior, validation,
 and remaining limitations. Include a real application screenshot for visible UI
 changes. Add a focused test when behavior or resource ownership warrants it;
-avoid tests that merely restate the implementation.
+avoid tests that merely restate the implementation. Register a headless test
+with `add_test` in CMakeLists.txt (or linux/CMakeLists.txt): CI runs every
+registered test through `ctest` on both platforms. `linux/build.sh --test` and
+`tools/build_linux.py --test` keep their own lists of the same Linux suites, so
+add a new Linux suite there too. Suites that move the pointer, replace cursors or
+open windows stay unregistered and need `--run` on an isolated desktop.
 
 Contributions are accepted under the project's MIT license. Do not add another
 product's private source, cursor assets, sounds, or incompatible licensed code.
