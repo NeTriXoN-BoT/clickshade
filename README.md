@@ -1,16 +1,88 @@
-![ClickShade — desktop cursor effects](assets/github-banner.png)
+<p align="center">
+  <img src="assets/readme-hero.svg" alt="ClickShade — make every click easy to follow" width="100%">
+</p>
 
-ClickShade makes your mouse pointer easier to follow and a bit more fun to use. Hold a mouse button and the cursor goes dark. Put a highlight, a spotlight or a crosshair under it. Give each mouse button its own click animation and sound, add a typing sound if you like, and shake the mouse when you've lost the pointer. It's a native C++ app for Windows with a Linux port, and nothing leaves your computer.
+<p align="center">
+  Cursor highlights, click effects, a magnifier and on-screen keystrokes.<br>
+  Make presentations, tutorials and everyday desktop use easier to follow.
+</p>
 
-> [!NOTE]
-> This project is vibe coded. It's made by one person who picked the features, tested everything on their own machines and decided what ships, with AI coding assistants writing a large share of the code. It's still a young project, so if something looks off, please [open an issue](../../issues).
+<!-- Keep the version label, direct download URL and ZIP filename in sync with published releases. -->
+<p align="center">
+  <a href="https://github.com/NeTriXoN-BoT/clickshade/releases/download/v1.1/ClickShade-1.1-Windows-Linux.zip"><img src="assets/download-button.svg" alt="Download ClickShade 1.1 for Windows and Linux (ZIP)" width="320" height="64"></a>
+  <a href="https://github.com/NeTriXoN-BoT/clickshade/releases/latest"><img src="assets/releases-button.svg" alt="View the latest release and release notes" width="190" height="64"></a>
+</p>
+
+<p align="center">
+  <strong>v1.1</strong> · Windows 10 / 11 (64-bit) · Linux (x86-64)<br>
+  Free and open source · No account · No telemetry
+</p>
+
+<p align="center">
+  <a href="#get-started">Get started</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#screenshots">Screenshots</a> ·
+  <a href="#help">Help</a> ·
+  <a href="#technical-details">Technical details</a>
+</p>
+
+## Get started
+
+**New to GitHub?** Click **Download ClickShade** above to download the app directly. The ZIP includes both platforms; no GitHub account or build tools are needed.
+
+### Windows
+
+1. **Download and extract.** Right-click `ClickShade-1.1-Windows-Linux.zip`, choose **Extract All…**, and save it somewhere you want to keep the app.
+2. **Open ClickShade.** Open the extracted `Windows` folder and double-click `ClickShade.exe`. Keep the `sounds` folder beside it.
+3. **Make it yours.** The settings window opens immediately. Choose your cursor, highlight and click effects. Changes save automatically.
+
+Requires Windows 10 version 1703 or later, or Windows 11, **64-bit**. No installer or extra runtime is required. Closing settings keeps ClickShade in the system tray; choose **Quit** from its tray menu to stop it and restore your cursors.
 
 > [!IMPORTANT]
-> While it runs, ClickShade replaces the Windows system cursors with its own copies and restores the originals when it pauses or quits. If it is ever closed the hard way, run `Restore-cursors.cmd` from the download or `ClickShade.exe --restore`. The Windows build is unsigned, so SmartScreen may warn on first start.
+> The Windows app is **unsigned**, so SmartScreen may warn on first launch. While running, ClickShade temporarily replaces the system cursors and restores them when paused or quit. If it is ever forcibly closed and your cursor stays changed, run `Restore-cursors.cmd` from the extracted `Windows` folder or press **Ctrl+Alt+F10** while ClickShade is running. See [security information](SECURITY.md).
 
-![The ClickShade settings window on Windows](assets/screenshots/windows-cursor.png)
+<details>
+<summary><strong>Linux setup and compatibility</strong></summary>
+
+Extract the same ZIP, open a terminal in its `Linux` folder, then run:
+
+```sh
+chmod +x ClickShade
+./ClickShade
+```
+
+Keep the `sounds` folder beside the executable. The supplied x86-64 build requires GTK 3.24, GLib, Cairo, GLIBC 2.38 / GLIBCXX 3.4.32 or newer, and X11 with XInput 2.1, XFixes 4 and a compositing window manager. Sound uses PulseAudio or PipeWire's PulseAudio service.
+
+GNOME Wayland needs the bundled experimental Shell extension. Other Wayland compositors are unsupported, and some Windows features are unavailable on Linux. Read the [Linux setup guide](linux/README.md) and [platform comparison](#platform-support) before downloading.
+
+</details>
+
+<details>
+<summary><strong>Updating, portable settings and checksums</strong></summary>
+
+To update, quit ClickShade and extract the new release over your existing folder, or into a new one. Your settings carry over. If you move the app, enable **Start with Windows** again from its new location. GNOME users should reinstall the bundled extension after updating and log out and back in.
+
+To keep Windows settings beside the app, create an empty file named `ClickShade.portable` next to `ClickShade.exe`. The app then stores `settings.ini`, `profiles` and `crash-reports` there. Keep those files when updating.
+
+`CHECKSUMS.sha256` in the ZIP covers every other file in the archive. [All releases](https://github.com/NeTriXoN-BoT/clickshade/releases) include the downloadable app; GitHub's automatically generated **Source code** archives are for building it yourself.
+
+</details>
 
 ## Features
+
+| | What you can do |
+| --- | --- |
+| **Make your pointer stand out** | Add a highlight, soft glow, crosshair or spotlight. On Windows, resize and recolor every cursor shape, add a shadow, or darken it while clicking. |
+| **Show every click** | Choose from six click animations, set a color for each mouse button, and add optional pointer trails. |
+| **Present with clarity** | Enlarge details with a live magnifier and show shortcuts or typed keys on screen. Include effects in recordings or hide them from capture on Windows. |
+| **Add sound feedback** | Pick from eleven mouse sound sets and five keyboard sets, with separate controls and volume. Sounds are off by default. |
+| **Fit your workflow** | Pause in fullscreen games, exclude individual apps, and control effects from the tray or configurable shortcuts. |
+| **Keep your own style** | Use dark or light settings, adjust colors and interface zoom, and save profiles with backup and import. |
+
+Windows provides the full feature set. See [platform support](#platform-support) for Linux and experimental GNOME Wayland differences.
+
+<details>
+<summary><strong>Explore the complete feature list</strong></summary>
 
 | Feature | What you get |
 | --- | --- |
@@ -32,30 +104,44 @@ ClickShade makes your mouse pointer easier to follow and a bit more fun to use. 
 | Settings window | A sidebar, compact cards, a reset on every card and every slider, dark and light palettes, extra zoom, and an animated spectrum line you can turn off. |
 | Everyday controls | Nine global shortcuts, tray menu, optional start with Windows, settings profiles with backup and import, and a full defaults reset. |
 
-### What ClickShade does not do
+</details>
 
-- It never moves the pointer, changes mouse speed or acceleration, or replays input. Effects follow the position Windows reports.
-- It does not record what you type. Keyboard input is observed only while keyboard sounds or the key display are on. Sounds only learn whether an ordinary key, Space, Enter or Backspace went down; the key display turns a press into a keycap or a typed character that is dropped as soon as its row fades.
-- It has no account, telemetry, activity log, updater or network service.
-- It does not inject into games or work around anti-cheat. It pauses in fullscreen games by default; quit it entirely if a game's rules require that.
+## Screenshots
 
-## Requirements
+<table>
+  <tr>
+    <th>Cursor customization</th>
+    <th>Presenter tools</th>
+  </tr>
+  <tr>
+    <td><a href="assets/screenshots/windows-cursor.png"><img src="assets/screenshots/windows-cursor.png" alt="ClickShade on Windows: cursor styles, press behavior, size, colors and shake to find" width="420"></a></td>
+    <td><a href="assets/screenshots/windows-presenter.png"><img src="assets/screenshots/windows-presenter.png" alt="ClickShade on Windows: magnifier and on-screen key display settings" width="420"></a></td>
+  </tr>
+</table>
 
-**Windows:** Windows 10 version 1703 or later, or Windows 11, 64-bit. No installer, no runtime to install.
+<details>
+<summary><strong>More screenshots</strong></summary>
 
-**Linux:** an x86-64 system with GTK 3.24, GLib, Cairo, X11 with XInput 2.1 and XFixes 4, a compositing window manager, and GLIBC 2.38 / GLIBCXX 3.4.32 or newer. Sound uses PulseAudio or PipeWire's PulseAudio service. GNOME on Wayland needs the bundled Shell extension; other Wayland compositors are not supported. See [linux/README.md](linux/README.md).
+| Highlights | Click effects |
+| --- | --- |
+| ![Highlight and trail settings](assets/screenshots/windows-highlight.png) | ![Per-button click animation settings](assets/screenshots/windows-clicks.png) |
+| **Sounds** | **Appearance** |
+| ![Mouse and keyboard sound settings](assets/screenshots/windows-sounds.png) | ![Colors, profiles and interface settings](assets/screenshots/windows-appearance.png) |
+| **Rules** | **Shortcuts** |
+| ![Pause rules, startup and administrator settings](assets/screenshots/windows-rules.png) | ![Global keyboard shortcut settings](assets/screenshots/windows-shortcuts.png) |
 
-## Install
+</details>
 
-1. Download `ClickShade-<version>-Windows-Linux.zip` from [Releases](../../releases) and extract it somewhere permanent. The `sounds` folder must stay next to the executable.
-2. **Windows:** run `Windows/ClickShade.exe`. **Linux:** run `Linux/ClickShade` (`chmod +x ClickShade` first if extraction dropped the executable bit).
-3. The settings window opens. Closing it keeps ClickShade in the tray; **Quit** restores your cursors and exits.
+## Using ClickShade
 
-Out of the box, a held left or right button darkens the cursor, a yellow highlight follows the pointer, and clicks draw neon blue and neon red rings. Sounds, trails, shake-to-locate, middle-click effects, the magnifier, the key display, administrator mode and start with Windows are off until you turn them on.
+On first launch, holding the left or right mouse button darkens the cursor, a yellow highlight follows the pointer, and clicks draw blue or red neon rings. Sounds, trails, shake to find, middle-click effects, the magnifier and key display are off until you enable them. Administrator mode and start with Windows are also opt-in.
 
-`CHECKSUMS.sha256` in the ZIP covers every file. To keep settings next to the executable instead of in your profile, create an empty file named `ClickShade.portable` beside `ClickShade.exe`; `settings.ini`, `profiles` and `crash-reports` then sit right next to it.
+Use the tray menu to toggle effects, reopen settings, pause or quit. The default restore-and-pause shortcut is **Ctrl+Alt+F10** on Windows and **Ctrl+Shift+F10** on Linux. Other shortcuts are unassigned until you set them.
 
-## Using it
+The [settings guide](docs/SETTINGS.md) explains every control and range.
+
+<details>
+<summary><strong>Settings pages, shortcuts and command-line options</strong></summary>
 
 The window has eight pages. Every setting saves as you change it, and every card has a **Reset** that only lights up when something in it differs from the default.
 
@@ -94,7 +180,14 @@ The tray menu offers the same toggles, restore and quit. Shortcuts need Ctrl, Al
 
 Only one instance runs per session; a second launch just opens the settings window. The Linux binary accepts `--background`, `--restore`, `--quit`, `--version` and `--help`.
 
-## Troubleshooting
+</details>
+
+## Help
+
+For a bug or feature request, [open an issue](https://github.com/NeTriXoN-BoT/clickshade/issues). Include your operating system, ClickShade version and what happened. For security reports, see [SECURITY.md](SECURITY.md).
+
+<details>
+<summary><strong>Troubleshooting</strong></summary>
 
 | Symptom | Likely cause |
 | --- | --- |
@@ -113,11 +206,27 @@ Only one instance runs per session; a second launch just opens the settings wind
 | SmartScreen or antivirus warns about the EXE | The binary is unsigned. Build from source if you want to verify it; see [SECURITY.md](SECURITY.md). |
 | Linux: no highlights or click effects | X11 needs a compositing window manager and XInput 2.1. On GNOME Wayland, install the extension from `Linux/gnome-extension`. |
 
-## Uninstall
+</details>
+
+<details>
+<summary><strong>Uninstall ClickShade</strong></summary>
 
 Turn off **Start with Windows** (and administrator mode, which removes its scheduled task), choose **Quit**, then delete the extracted folder. Settings live in `%LOCALAPPDATA%\ClickShade` on Windows and `~/.config/clickshade` on Linux; delete them too if you want a clean slate. Quit removes the temporary cursor files ClickShade keeps under `%TEMP%\ClickShade` while it runs. ClickShade never deletes sound or cursor files you selected.
 
-## Platform support
+</details>
+
+## Technical details
+
+<details>
+<summary><strong>Requirements and platform support</strong></summary>
+
+### Requirements
+
+**Windows:** Windows 10 version 1703 or later, or Windows 11, 64-bit. No installer, no runtime to install.
+
+**Linux:** an x86-64 system with GTK 3.24, GLib, Cairo, X11 with XInput 2.1 and XFixes 4, a compositing window manager, and GLIBC 2.38 / GLIBCXX 3.4.32 or newer. Sound uses PulseAudio or PipeWire's PulseAudio service. GNOME on Wayland needs the bundled Shell extension; other Wayland compositors are not supported. See [linux/README.md](linux/README.md).
+
+### Platform support
 
 | Capability | Windows | Composited Linux X11 | GNOME Wayland adapter |
 | --- | --- | --- | --- |
@@ -137,13 +246,12 @@ Turn off **Start with Windows** (and administrator mode, which removes its sched
 
 Xwayland is not a route to global native Wayland input. KDE Plasma, wlroots and other Wayland compositors would need dedicated adapters; the GNOME extension does not cover them. The supplied binaries are x64 builds.
 
-## How it was built
+</details>
+
+<details>
+<summary><strong>Build from source and contribute</strong></summary>
 
 ClickShade is C++17. On Windows it observes the mouse through Raw Input without blocking it, replaces system cursor roles with its own prepared multi-size cursor files, draws effects in small click-through layered windows paced by one-shot timer deadlines, hosts the magnifier lens in the Windows Magnification API, and mixes sound in a sixteen-voice WASAPI mixer with a waveOut fallback. A dedicated receiver thread keeps accessibility-event floods out of the input and render queues. On Linux it uses XInput 2 and XFixes with Cairo overlays, and talks to the GNOME extension over D-Bus. The design is written up in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the effect references (KDE, Apple, screen-recorder conventions) in [docs/EFFECTS.md](docs/EFFECTS.md).
-
-Use of AI: most of the code, tests and documentation were written with AI coding assistants. A human chose the goals, reviewed the results and tested the application on real hardware. AI output can contain mistakes, so check claims against the code and your own experience, and report anything wrong.
-
-## Development
 
 ### Windows with Visual Studio
 
@@ -173,6 +281,20 @@ node linux/gnome-extension/tests.mjs
 
 `python tools/package_release.py` builds the release ZIP from both binaries and checks architectures, freshness and checksums. The **Draft release** workflow does the same on GitHub for an existing tag. Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Legal
+</details>
+
+<details>
+<summary><strong>Privacy and project transparency</strong></summary>
+
+- It never moves the pointer, changes mouse speed or acceleration, or replays input. Effects follow the position Windows reports.
+- It does not record what you type. Keyboard input is observed only while keyboard sounds or the key display are on. Sounds only learn whether an ordinary key, Space, Enter or Backspace went down; the key display turns a press into a keycap or a typed character that is dropped as soon as its row fades.
+- It has no account, telemetry, activity log, updater or network service.
+- It does not inject into games or work around anti-cheat. It pauses in fullscreen games by default; quit it entirely if a game's rules require that.
+
+ClickShade is a young, one-person project built with AI coding assistants. The maintainer chooses the features, reviews the results and tests the application on real hardware; AI assistants have written a large share of the code, tests and documentation. If something looks wrong, please [report it](https://github.com/NeTriXoN-BoT/clickshade/issues).
+
+</details>
+
+## License
 
 Licensed under the [MIT License](LICENSE). The code, the icon and banner, the fallback classic arrow and the example sounds are original. Windows cursor files are read from your own Windows installation and never redistributed. The Plasma-style shake preset follows the parameters published in KWin's source; no KDE code is included. Windows, macOS, KDE Plasma, XSplit, OBS and other names belong to their owners; ClickShade is not affiliated with any of them. Compiler and runtime notices are in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

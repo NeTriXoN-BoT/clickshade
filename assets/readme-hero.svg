@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+<title id="title">ClickShade</title>
+<desc id="desc">Make every click easy to follow. Cursor effects and presenter tools for your desktop.</desc>
+<defs><linearGradient id="hero-background" x2="1" y2="1"><stop stop-color="#141f2d"/><stop offset="1" stop-color="#0b111b"/></linearGradient></defs>
+<rect width="1280" height="360" rx="20" fill="url(#hero-background)"/>
+<g fill="none" stroke="#79dfc6"><circle cx="1100" cy="180" r="245" opacity=".1"/><circle cx="1100" cy="180" r="195" opacity=".15"/><circle cx="1100" cy="180" r="145" opacity=".2"/></g>
+<g font-family="Segoe UI,DejaVu Sans,sans-serif">
+<text x="64" y="70" font-size="16" font-weight="700" letter-spacing="2" fill="#82e5d0">CURSOR EFFECTS &amp; PRESENTER TOOLS</text>
+<text x="59" y="172" font-size="82" font-weight="700" fill="#f4f8fc">ClickShade</text>
+<text x="64" y="234" font-size="30" fill="#e4edf4">Make every click easy to follow.</text>
+<text x="64" y="302" font-size="18" fill="#a4b5c6">Your pointer. Your style. All on your computer.</text>
+</g>
+<g transform="translate(970 51) scale(1.01)">
+  <defs>
+    <linearGradient id="tile" x2="0" y2="1"><stop stop-color="#1c2b3c"/><stop offset="1" stop-color="#091019"/></linearGradient>
+    <linearGradient id="orbit" x2="0" y2="1"><stop stop-color="#5fe8ca"/><stop offset="1" stop-color="#45a5e9"/></linearGradient>
+  </defs>
+  <rect x="6" y="6" width="244" height="244" rx="55" fill="url(#tile)" stroke="#35465a"/>
+  <circle cx="128" cy="124" r="76" fill="#162e39" stroke="url(#orbit)" stroke-width="10"/>
+  <polygon points="72,48 86,187 117,158 143,202 164,189 139,144 180,138" transform="translate(2 4)" fill="#08111c" stroke="#08111c" stroke-width="10" stroke-linejoin="round"/>
+  <polygon points="72,48 86,187 117,158 143,202 164,189 139,144 180,138" fill="#f2f8fd"/>
+  <polygon points="72,48 180,138 139,144 164,189 154,195 126,143 157,137" fill="#8adadf"/>
+  <polygon points="72,48 86,187 117,158 143,202 164,189 139,144 180,138" fill="none" stroke="#0b1724" stroke-width="5.5" stroke-linejoin="round"/>
+</g>
+</svg>
