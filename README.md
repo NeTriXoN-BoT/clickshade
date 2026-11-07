@@ -27,9 +27,9 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif" alt="Animated illustration of cursor highlights, blue and red click feedback, and a moving 2× magnifier" width="960">
+  <img src="assets/demo.gif" alt="Scripted showcase of cursor customization, shake to find, highlights, trails, click effects, magnifier, key display, sounds, rules, recording controls, recovery, settings and profiles" width="960">
   <br>
-  <sub>Scripted preview of cursor highlights, left/right click effects and 2× magnification.</sub>
+  <sub>Scripted Windows feature showcase. GIF is silent; Linux capabilities vary. <a href="#features">Explore all features.</a></sub>
 </p>
 
 ## Get started
