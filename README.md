@@ -7,14 +7,14 @@
   Make presentations, tutorials and everyday desktop use easier to follow.
 </p>
 
-<!-- Keep the version label, direct download URL and ZIP filename in sync with published releases. -->
+<!-- The release workflows maintain this stable asset name for /releases/latest/download/. -->
 <p align="center">
-  <a href="https://github.com/NeTriXoN-BoT/clickshade/releases/download/v1.1/ClickShade-1.1-Windows-Linux.zip"><img src="assets/download-button.svg" alt="Download ClickShade 1.1 for Windows and Linux (ZIP)" width="320" height="64"></a>
+  <a href="https://github.com/NeTriXoN-BoT/clickshade/releases/latest/download/ClickShade-Windows-Linux.zip"><img src="assets/download-button.svg" alt="Download the latest ClickShade release for Windows and Linux (ZIP)" width="320" height="64"></a>
   <a href="https://github.com/NeTriXoN-BoT/clickshade/releases/latest"><img src="assets/releases-button.svg" alt="View the latest release and release notes" width="190" height="64"></a>
 </p>
 
 <p align="center">
-  <strong>v1.1</strong> · Windows 10 / 11 (64-bit) · Linux (x86-64)<br>
+  <strong>Latest stable release</strong> · Windows 10 / 11 (64-bit) · Linux (x86-64)<br>
   Free and open source · No account · No telemetry
 </p>
 
@@ -32,7 +32,7 @@
 
 ### Windows
 
-1. **Download and extract.** Right-click `ClickShade-1.1-Windows-Linux.zip`, choose **Extract All…**, and save it somewhere you want to keep the app.
+1. **Download and extract.** Right-click `ClickShade-Windows-Linux.zip`, choose **Extract All…**, and save it somewhere you want to keep the app.
 2. **Open ClickShade.** Open the extracted `Windows` folder and double-click `ClickShade.exe`. Keep the `sounds` folder beside it.
 3. **Make it yours.** The settings window opens immediately. Choose your cursor, highlight and click effects. Changes save automatically.
 
@@ -280,6 +280,8 @@ node linux/gnome-extension/tests.mjs
 ```
 
 `python tools/package_release.py` builds the release ZIP from both binaries and checks architectures, freshness and checksums. The **Draft release** workflow does the same on GitHub for an existing tag. Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The **Draft release** workflow also attaches an identical copy named `ClickShade-Windows-Linux.zip`. The **Update download asset** workflow maintains that name when a release is published, including releases uploaded manually. The README's `/releases/latest/download/ClickShade-Windows-Linux.zip` link therefore follows the latest stable release without a README edit. To refresh the copy on an existing release, run **Update download asset** from Actions and enter its tag (or leave it blank for the latest stable release).
 
 </details>
 

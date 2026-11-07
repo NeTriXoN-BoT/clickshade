@@ -43,6 +43,7 @@ jobs:
               raise SystemExit('Tag and package version differ; update all release version fields first.')
           PY
           python3 tools/package_release.py --expected-revision "$(git rev-parse HEAD)" --build-dir ci/windows --linux-build-dir ci/linux --output dist/ClickShade-${RELEASE_TAG#v}-Windows-Linux.zip --compiler "Windows: MSVC Windows-2022 runner; Linux: Ubuntu-24.04 GCC; CMake Release"
+          cp "dist/ClickShade-${RELEASE_TAG#v}-Windows-Linux.zip" dist/ClickShade-Windows-Linux.zip
       - name: Create draft for review
         env:
           GH_TOKEN: ${{ github.token }}
