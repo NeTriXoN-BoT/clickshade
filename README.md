@@ -26,6 +26,12 @@
   <a href="#technical-details">Technical details</a>
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Animated illustration of cursor highlights, blue and red click feedback, and a moving 2× magnifier" width="960">
+  <br>
+  <sub>Scripted preview of cursor highlights, left/right click effects and 2× magnification.</sub>
+</p>
+
 ## Get started
 
 **New to GitHub?** Click **Download ClickShade** above to download the app directly. The ZIP includes both platforms; no GitHub account or build tools are needed.
