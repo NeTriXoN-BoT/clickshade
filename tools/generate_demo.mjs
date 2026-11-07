@@ -76,6 +76,9 @@ function position(t) {
 // composited. It illustrates the application's exclusion of its own overlays.
 const lensSize = 190;
 const lensMask = await sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${lensSize}" height="${lensSize}"><circle cx="95" cy="95" r="92" fill="white"/></svg>`)).png().toBuffer();
+// Reuse CreateClassicArrow's Windows arrow silhouette from cursor_engine.cpp:
+// vertical left edge, narrow arrowhead and the familiar angled stem.
+const cursorOutline = 'M.5 .5V17.4L4.9 13.2 8.1 20 10.9 18.8 7.8 12.1 13.4 12.1Z';
 
 for (let frame = 0; frame < seconds * fps; frame++) {
   const t = frame / fps;
@@ -103,7 +106,7 @@ for (let frame = 0; frame < seconds * fps; frame++) {
     layers.push({ input: crop, raw: { width: lensSize, height: lensSize, channels: 4 }, left, top });
     layers.push({ input: svg(`<g opacity="${lensAmount}"><circle cx="${x}" cy="${y}" r="94" fill="none" stroke="#08111b" stroke-width="9"/><circle cx="${x}" cy="${y}" r="94" fill="none" stroke="#79dfc6" stroke-width="3"/></g>`), left: 0, top: 0 });
   }
-  const cursor = `<g transform="translate(${x} ${y})"><path d="M0 0 3 30 10 23 17 35 24 31 17 19 29 17Z" fill="${pressed ? '#182633' : '#f2f8fd'}" stroke="${pressed ? '#e0f4ff' : '#08131f'}" stroke-width="2.2" stroke-linejoin="round"/></g>`;
+  const cursor = `<g transform="translate(${x} ${y}) scale(1.5)"><path d="${cursorOutline}" fill="${pressed ? '#000000' : '#ffffff'}" stroke="${pressed ? '#ffffff' : '#000000'}" stroke-width="1" stroke-linejoin="miter" stroke-miterlimit="2"/></g>`;
   layers.push({ input: svg(cursor), left: 0, top: 0 });
   await sharp(base).composite(layers).png().toFile(path.join(work, `frame-${String(frame).padStart(4, '0')}.png`));
 }
